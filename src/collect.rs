@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     config::ResolvedConfig,
-    model::{ClusterSummary, NodeSummary, OsdSummary, Snapshot},
+    model::{ClusterSummary, HealthCheck, NodeSummary, OsdSummary, Snapshot},
     ssh::ssh_capture,
     stream::NODE_FACTS_SNIPPET,
     util::{MAX_PARALLEL_HOSTS, map_parallel, ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
@@ -16,6 +16,9 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
     let status_out = ssh_capture(&cfg.admin_host, "sudo -n ceph -s --format json")?;
     let tree_out = ssh_capture(&cfg.admin_host, "sudo -n ceph osd tree --format json")?;
     let df_out = ssh_capture(&cfg.admin_host, "sudo -n ceph osd df --format json")?;
+    // Latency is supplementary, so a cluster that refuses this query still gets
+    // a snapshot.
+    let perf_out = ssh_capture(&cfg.admin_host, "sudo -n ceph osd perf --format json").ok();
 
     let status: Value = serde_json::from_str(status_out.trim())
         .with_context(|| "failed to parse ceph status json")?;
@@ -23,9 +26,10 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
         serde_json::from_str(tree_out.trim()).with_context(|| "failed to parse osd tree json")?;
     let df: Value =
         serde_json::from_str(df_out.trim()).with_context(|| "failed to parse osd df json")?;
+    let perf = perf_out.and_then(|perf| serde_json::from_str::<Value>(perf.trim()).ok());
 
     let cluster = parse_cluster_summary(&status);
-    let osds = parse_osds(&tree, &df);
+    let osds = parse_osds(&tree, &df, perf.as_ref());
     let nodes = map_parallel(&cfg.hosts, MAX_PARALLEL_HOSTS, |host| collect_node(host))
         .into_iter()
         .zip(&cfg.hosts)
@@ -95,10 +99,50 @@ pub(crate) fn parse_cluster_summary(status: &Value) -> ClusterSummary {
         read_ops_sec: ptr_u64(status, "/pgmap/read_op_per_sec"),
         write_ops_sec: ptr_u64(status, "/pgmap/write_op_per_sec"),
         pg_states,
+        health_checks: parse_health_checks(status),
     }
 }
 
-pub(crate) fn parse_osds(tree: &Value, df: &Value) -> Vec<OsdSummary> {
+fn parse_health_checks(status: &Value) -> Vec<HealthCheck> {
+    let Some(checks) = status.pointer("/health/checks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut parsed = checks
+        .iter()
+        .map(|(code, check)| HealthCheck {
+            code: code.clone(),
+            severity: ptr_str(check, "/severity"),
+            message: ptr_str(check, "/summary/message"),
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by(|left, right| left.code.cmp(&right.code));
+    parsed
+}
+
+/// Maps OSD id to the latency `ceph osd perf` reports. The payload is optional,
+/// so a cluster where the query fails keeps its status, tree, and df data.
+pub(crate) fn parse_osd_perf(perf: Option<&Value>) -> HashMap<i64, (u64, u64)> {
+    let mut by_osd = HashMap::new();
+    let Some(infos) = perf
+        .and_then(|perf| perf.pointer("/osdstats/osd_perf_infos"))
+        .and_then(Value::as_array)
+    else {
+        return by_osd;
+    };
+    for info in infos {
+        by_osd.insert(
+            ptr_i64(info, "/id"),
+            (
+                ptr_u64(info, "/perf_stats/commit_latency_ms"),
+                ptr_u64(info, "/perf_stats/apply_latency_ms"),
+            ),
+        );
+    }
+    by_osd
+}
+
+pub(crate) fn parse_osds(tree: &Value, df: &Value, perf: Option<&Value>) -> Vec<OsdSummary> {
+    let latency_by_osd = parse_osd_perf(perf);
     let mut host_by_osd = HashMap::new();
     let mut status_by_osd = HashMap::new();
 
@@ -124,6 +168,8 @@ pub(crate) fn parse_osds(tree: &Value, df: &Value) -> Vec<OsdSummary> {
     if let Some(nodes) = df.pointer("/nodes").and_then(Value::as_array) {
         for node in nodes {
             let id = ptr_i64(node, "/id");
+            let (commit_latency_ms, apply_latency_ms) =
+                latency_by_osd.get(&id).copied().unwrap_or_default();
             osds.push(OsdSummary {
                 id,
                 name: ptr_str(node, "/name"),
@@ -137,6 +183,8 @@ pub(crate) fn parse_osds(tree: &Value, df: &Value) -> Vec<OsdSummary> {
                 pgs: ptr_u64(node, "/pgs"),
                 used_kb: ptr_u64(node, "/kb_used"),
                 avail_kb: ptr_u64(node, "/kb_avail"),
+                commit_latency_ms,
+                apply_latency_ms,
             });
         }
     }
@@ -168,6 +216,8 @@ printf 'ceph_osd_processes=%s\n' "$count"
 printf 'osd_ids=%s\n' "$ids"
 printf 'cpu_percent=%s\n' "$cpu_pct"
 printf 'mem_percent=%s\n' "$mem_pct"
+printf 'io_stall_percent=%s\n' "$io_stall"
+printf 'cpu_stall_percent=%s\n' "$cpu_stall"
 "#,
         facts = NODE_FACTS_SNIPPET
     );
@@ -191,6 +241,14 @@ printf 'mem_percent=%s\n' "$mem_pct"
                     .unwrap_or_default(),
                 mem_percent: map
                     .get("mem_percent")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_default(),
+                io_stall_percent: map
+                    .get("io_stall_percent")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_default(),
+                cpu_stall_percent: map
+                    .get("cpu_stall_percent")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_default(),
                 error: None,
@@ -322,6 +380,59 @@ fn parse_key_values(output: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shapes taken from ceph 19.2.3 on a microceph cluster.
+    #[test]
+    fn cluster_summary_names_the_failing_health_checks() {
+        let status: Value = serde_json::from_str(
+            r#"{"health":{"status":"HEALTH_WARN","checks":{
+                 "OSD_NEARFULL":{"severity":"HEALTH_WARN","summary":{"message":"1 nearfull osd(s)"}},
+                 "MON_CLOCK_SKEW":{"severity":"HEALTH_WARN","summary":{"message":"clock skew detected"}}}}}"#,
+        )
+        .unwrap();
+
+        let cluster = parse_cluster_summary(&status);
+
+        let codes = cluster
+            .health_checks
+            .iter()
+            .map(|check| check.code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(codes, vec!["MON_CLOCK_SKEW", "OSD_NEARFULL"]);
+        assert_eq!(cluster.health_checks[1].message, "1 nearfull osd(s)");
+    }
+
+    #[test]
+    fn healthy_cluster_reports_no_checks() {
+        let status: Value =
+            serde_json::from_str(r#"{"health":{"status":"HEALTH_OK","checks":{},"mutes":[]}}"#)
+                .unwrap();
+
+        assert!(parse_cluster_summary(&status).health_checks.is_empty());
+    }
+
+    #[test]
+    fn osd_latency_is_merged_by_id_and_optional() {
+        let tree: Value = serde_json::from_str(r#"{"nodes":[]}"#).unwrap();
+        let df: Value =
+            serde_json::from_str(r#"{"nodes":[{"id":1,"name":"osd.1"},{"id":2,"name":"osd.2"}]}"#)
+                .unwrap();
+        let perf: Value = serde_json::from_str(
+            r#"{"osdstats":{"osd_perf_infos":[
+                 {"id":2,"perf_stats":{"commit_latency_ms":7,"apply_latency_ms":3}}]}}"#,
+        )
+        .unwrap();
+
+        let merged = parse_osds(&tree, &df, Some(&perf));
+        assert_eq!(merged[0].commit_latency_ms, 0, "osd.1 has no perf entry");
+        assert_eq!(merged[1].commit_latency_ms, 7);
+        assert_eq!(merged[1].apply_latency_ms, 3);
+
+        // A cluster that refuses `ceph osd perf` still gets its OSD rows.
+        let without = parse_osds(&tree, &df, None);
+        assert_eq!(without.len(), 2);
+        assert_eq!(without[1].commit_latency_ms, 0);
+    }
 
     #[test]
     fn bench_command_cleans_up_unique_pool_on_exit() {

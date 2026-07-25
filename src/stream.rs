@@ -28,12 +28,15 @@ trap cleanup EXIT"#;
 pub(crate) const CLUSTER_STREAM_TICK: &str = r#"  sudo -n ceph -s --format json >"$dir/status" 2>/dev/null &
   sudo -n ceph osd tree --format json >"$dir/tree" 2>/dev/null &
   sudo -n ceph osd df --format json >"$dir/df" 2>/dev/null &
+  sudo -n ceph osd perf --format json >"$dir/perf" 2>/dev/null &
   wait
   status=$(tr -d '\n' <"$dir/status")
   tree=$(tr -d '\n' <"$dir/tree")
   df=$(tr -d '\n' <"$dir/df")
+  perf=$(tr -d '\n' <"$dir/perf")
+  [ -n "$perf" ] || perf=null
   if [ -n "$status" ] && [ -n "$tree" ] && [ -n "$df" ]; then
-    printf '{"type":"status","status":%s,"tree":%s,"df":%s}\n' "$status" "$tree" "$df"
+    printf '{"type":"status","status":%s,"tree":%s,"df":%s,"perf":%s}\n' "$status" "$tree" "$df" "$perf"
   else
     printf '{"type":"error","message":"ceph command failed"}\n'
   fi"#;
@@ -73,7 +76,13 @@ fi
 count=$(pgrep -c '[c]eph-osd' 2>/dev/null || true)
 count=${count:-0}
 ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id \([0-9][0-9]*\).*/\1/p' | paste -sd, -)
-mem_pct=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {avail=$2} END {if (total > 0) printf "%.1f", (total-avail)*100/total; else printf "0.0"}' /proc/meminfo)"#;
+mem_pct=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {avail=$2} END {if (total > 0) printf "%.1f", (total-avail)*100/total; else printf "0.0"}' /proc/meminfo)
+# Pressure stall shares. Absent before Linux 4.20 and on kernels built without
+# PSI, in which case both stay 0.0.
+io_stall=$(awk '/^some/ {split($2,a,"="); printf "%.1f", a[2]; found=1; exit} END {if (!found) printf "0.0"}' /proc/pressure/io 2>/dev/null)
+io_stall=${io_stall:-0.0}
+cpu_stall=$(awk '/^some/ {split($2,a,"="); printf "%.1f", a[2]; found=1; exit} END {if (!found) printf "0.0"}' /proc/pressure/cpu 2>/dev/null)
+cpu_stall=${cpu_stall:-0.0}"#;
 
 pub(crate) fn node_stream_command(interval_secs: u64) -> String {
     format!(
@@ -99,7 +108,7 @@ while true; do
   fi
   prev_total=$total
   prev_idle=$idle_all
-  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","cpu_percent":%s,"mem_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$cpu_pct" "$mem_pct"
+  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
   sleep {interval_secs}
 done
 "#,
@@ -129,6 +138,8 @@ pub(crate) fn parse_node_stream_payload(host: &str, payload: &str) -> Result<Nod
         osd_ids: ptr_str(&value, "/osd_ids"),
         cpu_percent: ptr_f64(&value, "/cpu_percent"),
         mem_percent: ptr_f64(&value, "/mem_percent"),
+        io_stall_percent: ptr_f64(&value, "/io_stall_percent"),
+        cpu_stall_percent: ptr_f64(&value, "/cpu_stall_percent"),
         error: None,
     })
 }

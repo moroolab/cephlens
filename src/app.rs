@@ -605,6 +605,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
         let df = value
             .pointer("/df")
             .ok_or_else(|| anyhow!("cluster stream missing df"))?;
+        let perf = value.pointer("/perf").filter(|perf| !perf.is_null());
         let snapshot = Snapshot {
             captured_at: Utc::now(),
             profile: app.profile.clone(),
@@ -612,7 +613,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
             hosts: app.hosts.clone(),
             cluster: parse_cluster_summary(status),
             nodes: ordered_nodes(app),
-            osds: parse_osds(tree, df),
+            osds: parse_osds(tree, df, perf),
         };
         record_session_snapshot(app, &snapshot);
         app.snapshot = Some(snapshot);

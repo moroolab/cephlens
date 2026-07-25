@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     kfstrace::{KfsEvent, kfs_op_rows},
-    model::{NodeSummary, Snapshot},
+    model::{HealthCheck, NodeSummary, Snapshot},
     radostrace::{RadosEvent, rados_pool_rows},
     trace::{TraceEvent, TraceGraphRow, dominant_component},
     util::short,
@@ -46,10 +46,18 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
             };
             insights.push(Insight {
                 level,
-                text: format!(
-                    "cluster health {}; run ceph health detail on {}",
-                    snapshot.cluster.health, input.admin_host
-                ),
+                text: if snapshot.cluster.health_checks.is_empty() {
+                    format!(
+                        "cluster health {}; run ceph health detail on {}",
+                        snapshot.cluster.health, input.admin_host
+                    )
+                } else {
+                    format!(
+                        "cluster health {}: {}",
+                        snapshot.cluster.health,
+                        health_check_summary(&snapshot.cluster.health_checks)
+                    )
+                },
             });
         }
         if !snapshot.cluster.pg_states.contains("active+clean") {
@@ -100,6 +108,7 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
     if !active_rows.is_empty() {
         insights.extend(osd_trace_insights(input.node_summaries, &active_rows));
     }
+    insights.extend(node_pressure_insights(input.node_summaries));
     insights.extend(kfs_insights(input.kfs_events));
     insights.extend(rados_insights(input.rados_events));
     if let Some(cross) = cross_source_insight(&active_rows, input.rados_events) {
@@ -117,6 +126,51 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
     }
 
     insights
+}
+
+/// Names the checks behind a HEALTH_WARN or HEALTH_ERR. `ceph -s` already
+/// carries them, so the operator does not have to leave the TUI to find out why
+/// the cluster is unhealthy. Only the first few fit on one insight line.
+fn health_check_summary(checks: &[HealthCheck]) -> String {
+    const SHOWN: usize = 3;
+    let mut summary = checks
+        .iter()
+        .take(SHOWN)
+        .map(|check| format!("{} {}", check.code, short(&check.message, 60)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if checks.len() > SHOWN {
+        summary.push_str(&format!(" (+{} more)", checks.len() - SHOWN));
+    }
+    summary
+}
+
+fn node_pressure_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<Insight> {
+    let mut stalled = node_summaries
+        .values()
+        .filter(|node| node.io_stall_percent >= 5.0)
+        .collect::<Vec<_>>();
+    stalled.sort_by(|left, right| {
+        right
+            .io_stall_percent
+            .total_cmp(&left.io_stall_percent)
+            .then_with(|| left.host.cmp(&right.host))
+    });
+    stalled
+        .into_iter()
+        .take(2)
+        .map(|node| Insight {
+            level: if node.io_stall_percent >= 20.0 {
+                InsightLevel::Bad
+            } else {
+                InsightLevel::Warn
+            },
+            text: format!(
+                "{} stalled on IO {:.1}% of the last 10s; storage below the OSD is a suspect",
+                node.host, node.io_stall_percent
+            ),
+        })
+        .collect()
 }
 
 fn osd_trace_insights(

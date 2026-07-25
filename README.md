@@ -50,7 +50,10 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 ## Features
 
 - Live cluster health, quorum, OSD counts, and IO throughput over a single SSH stream.
-- Per-node readiness: connection state, OSD ids, CPU and memory percent, and Ceph version/deployment.
+- Per-node readiness: connection state, OSD ids, CPU and memory percent, IO stall
+  share from `/proc/pressure/io`, and Ceph version/deployment.
+- Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
+  numbers, and health check names read straight out of `ceph -s`.
 - osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
 - No standing agent: no permanent daemon on the nodes; the osdtrace runner script removes itself on stop, quit, or TTL expiry. (The cephtrace tracer binaries you deploy do persist under `~/.cephlens/bin/`.)
 - Edit hosts and trace settings live in the TUI; changes apply to open SSH streams immediately.
@@ -217,6 +220,7 @@ admin host:
   sudo -n ceph -s --format json
   sudo -n ceph osd tree --format json
   sudo -n ceph osd df --format json
+  sudo -n ceph osd perf --format json
   sudo -n rados --version
 
 bench command:

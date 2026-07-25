@@ -360,7 +360,10 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(34),
-                Constraint::Length(32),
+                // Seven columns total 36 cells and their six gaps add 6, so the
+                // border needs 44. The three panel minimum stays under the gate
+                // below.
+                Constraint::Length(44),
                 Constraint::Min(60),
             ])
             .split(area);
@@ -1257,10 +1260,11 @@ fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(4),
                 Constraint::Length(5),
                 Constraint::Length(5),
+                Constraint::Length(5),
             ],
         )
         .header(
-            Row::new(["Host", "State", "T", "OSD", "CPU%", "MEM%"])
+            Row::new(["Host", "State", "T", "OSD", "CPU%", "MEM%", "IO%"])
                 .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
         .block(scroll_panel(
@@ -1313,6 +1317,9 @@ fn node_rows(app: &App) -> Vec<Row<'static>> {
             let mem = node
                 .map(|node| percent_label(node.mem_percent))
                 .unwrap_or_else(|| "-".to_owned());
+            let io_stall = node
+                .map(|node| percent_label(node.io_stall_percent))
+                .unwrap_or_else(|| "-".to_owned());
             let (glyph, glyph_color) = osdtrace_glyph(app, host);
             Row::new(vec![
                 Cell::from(short(host, 9)).style(Style::default().fg(ACCENT).bold()),
@@ -1324,6 +1331,9 @@ fn node_rows(app: &App) -> Vec<Row<'static>> {
                 ))),
                 Cell::from(mem).style(Style::default().fg(metric_color(
                     node.map(|node| node.mem_percent).unwrap_or_default(),
+                ))),
+                Cell::from(io_stall).style(Style::default().fg(stall_color(
+                    node.map(|node| node.io_stall_percent).unwrap_or_default(),
                 ))),
             ])
         })
@@ -1369,6 +1379,10 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from(pg_bar).style(Style::default().fg(BLUE)),
                 Cell::from(format_kb(osd.used_kb)),
                 Cell::from(format_kb(osd.avail_kb)),
+                Cell::from(latency_ms_label(osd.commit_latency_ms))
+                    .style(Style::default().fg(latency_color(osd.commit_latency_ms * 1_000))),
+                Cell::from(latency_ms_label(osd.apply_latency_ms))
+                    .style(Style::default().fg(latency_color(osd.apply_latency_ms * 1_000))),
             ])
         }
     });
@@ -1395,9 +1409,12 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(16),
                 Constraint::Length(9),
                 Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(7),
             ],
             Row::new(vec![
-                "OSD", "Host", "State", "Util", "PGs", "PG load", "Used", "Avail",
+                "OSD", "Host", "State", "Util", "PGs", "PG load", "Used", "Avail", "Commit",
+                "Apply",
             ]),
         )
     };
@@ -1567,6 +1584,27 @@ fn metric_color(value: f64) -> Color {
         WARN
     } else {
         OK
+    }
+}
+
+// Pressure stall shares run much lower than CPU or memory percentages. A host
+// spending a tenth of its time with a task blocked on IO is already worth
+// looking at, so these thresholds sit far below the metric_color ones.
+fn stall_color(value: f64) -> Color {
+    if value >= 20.0 {
+        BAD
+    } else if value >= 5.0 {
+        WARN
+    } else {
+        OK
+    }
+}
+
+fn latency_ms_label(value_ms: u64) -> String {
+    if value_ms == 0 {
+        "-".to_owned()
+    } else {
+        format!("{value_ms}ms")
     }
 }
 

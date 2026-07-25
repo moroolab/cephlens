@@ -6,6 +6,18 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Insights now name the checks behind a `HEALTH_WARN` or `HEALTH_ERR` instead of
+  telling the operator to go run `ceph health detail`. `ceph -s` already carried
+  them, so this costs no extra remote command.
+- The OSD table shows the commit and apply latency from `ceph osd perf`, which
+  puts Ceph's own view of a slow OSD next to the eBPF numbers. The query is
+  optional, so a cluster that refuses it keeps the rest of its status.
+- The node table shows the share of the last 10s that a host spent stalled on IO,
+  read from `/proc/pressure/io`, and an insight fires past 5%. Unlike a device
+  utilization figure this needs no OSD to block device mapping to be meaningful.
+
 ### Fixed
 
 - Node readiness no longer breaks on hosts without `ceph-osd` processes. The
