@@ -6,6 +6,49 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Added a flow view, opened with `m`, that shows the OSD, placement group, and
+  object behind the ops in the trace buffer. radostrace lines already name all
+  three, so the view needs no extra remote command; with only osdtrace running
+  it collapses to OSD and placement group. `o` orders it by op count or by
+  latency and `s` reverses the order. Each row also carries the mean op size,
+  which separates a slow heavy request from one that is slow for the little it
+  asks for. A read reports the length it requested rather than bytes returned,
+  so a client that always asks for 4MiB reports 4MiB whatever the object holds.
+- Insights now name the checks behind a `HEALTH_WARN` or `HEALTH_ERR` instead of
+  telling the operator to go run `ceph health detail`. `ceph -s` already carried
+  them, so this costs no extra remote command.
+- The OSD table shows the commit and apply latency from `ceph osd perf`, which
+  puts Ceph's own view of a slow OSD next to the eBPF numbers. The query is
+  optional, so a cluster that refuses it keeps the rest of its status.
+- The node table shows the share of the last 10s that a host spent stalled on IO,
+  read from `/proc/pressure/io`, and an insight fires past 5%. Unlike a device
+  utilization figure this needs no OSD to block device mapping to be meaningful.
+
+### Fixed
+
+- `x` now clears every captured trace source rather than osdtrace alone.
+- Node readiness no longer breaks on hosts without `ceph-osd` processes. The
+  remote OSD count fell back through `pgrep -c ... || echo 0`, which emitted two
+  lines because `pgrep -c` prints `0` and exits 1 on no match. The extra line
+  made the node stream payload invalid JSON on mon-only hosts.
+
+### Changed
+
+- The cluster status stream now runs its three admin queries at once instead of
+  one after another. On a four node microceph cluster the tick period dropped
+  from 2278ms to 1400ms at the default `refresh_secs = 1`, with the same payload.
+  `refresh_secs` is the pause between ticks, not the period, and the README now
+  says so.
+- `doctor` and `snapshot` now probe hosts concurrently instead of one at a time,
+  with at most 8 hosts in flight. Each host still sees one SSH connection at a
+  time and the doctor report keeps its previous order.
+- Raised the declared minimum supported Rust version to 1.88. The source uses
+  let chains, which are stable only from 1.88, so builds on 1.85 through 1.87
+  failed despite the previous `rust-version = "1.85"`. CI now builds against the
+  declared MSRV.
+
 ## [0.1.4] - 2026-07-07
 
 ### Added

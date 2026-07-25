@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::{
     collect::{parse_cluster_summary, parse_osds, run_probe},
     editor::ConfigEditor,
+    flow::{FlowMetric, FlowSort},
     kfstrace::{KfsEvent, parse_kfs_event},
     model::{NodeSummary, Snapshot},
     radostrace::{RadosEvent, parse_rados_event},
@@ -177,6 +178,10 @@ pub(crate) struct App {
     pub(crate) trace_following: bool,
     pub(crate) trace_session: Option<String>,
     pub(crate) trace_source: TraceSource,
+    pub(crate) flow_view: bool,
+    pub(crate) flow_metric: FlowMetric,
+    pub(crate) flow_sort: FlowSort,
+    pub(crate) flow_scroll: usize,
     pub(crate) kfstrace_events: Vec<KfsEvent>,
     pub(crate) kfstrace_active: usize,
     pub(crate) kfstrace_stop: Arc<AtomicBool>,
@@ -605,6 +610,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
         let df = value
             .pointer("/df")
             .ok_or_else(|| anyhow!("cluster stream missing df"))?;
+        let perf = value.pointer("/perf").filter(|perf| !perf.is_null());
         let snapshot = Snapshot {
             captured_at: Utc::now(),
             profile: app.profile.clone(),
@@ -612,7 +618,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
             hosts: app.hosts.clone(),
             cluster: parse_cluster_summary(status),
             nodes: ordered_nodes(app),
-            osds: parse_osds(tree, df),
+            osds: parse_osds(tree, df, perf),
         };
         record_session_snapshot(app, &snapshot);
         app.snapshot = Some(snapshot);

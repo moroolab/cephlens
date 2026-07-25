@@ -5,7 +5,7 @@
 <h1 align="center">CephLens</h1>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)
 [![CI](https://github.com/xtrusia/cephlens/actions/workflows/ci.yml/badge.svg)](https://github.com/xtrusia/cephlens/actions/workflows/ci.yml)
 
 An SSH-driven Ceph investigation TUI with live cluster status, per-node
@@ -50,8 +50,16 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 ## Features
 
 - Live cluster health, quorum, OSD counts, and IO throughput over a single SSH stream.
-- Per-node readiness: connection state, OSD ids, CPU and memory percent, and Ceph version/deployment.
+- Per-node readiness: connection state, OSD ids, CPU and memory percent, IO stall
+  share from `/proc/pressure/io`, and Ceph version/deployment.
+- Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
+  numbers, and health check names read straight out of `ceph -s`.
 - osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
+- A flow view of the OSD, placement group, and object behind the observed
+  ops, built from the trace lines already streaming. radostrace names the
+  object so the view has three levels; with only osdtrace it collapses to
+  OSD and placement group. Rows carry the mean op size next to the latency; a
+  read reports the length it requested, not the bytes returned.
 - No standing agent: no permanent daemon on the nodes; the osdtrace runner script removes itself on stop, quit, or TTL expiry. (The cephtrace tracer binaries you deploy do persist under `~/.cephlens/bin/`.)
 - Edit hosts and trace settings live in the TUI; changes apply to open SSH streams immediately.
 - Export recorded sessions as Markdown reports with the same diagnostic rules used by the TUI.
@@ -60,7 +68,8 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 
 Controller (where the TUI runs):
 
-- Rust 1.85+ (edition 2024) to build.
+- Rust 1.88+ (edition 2024) to build. The source uses let chains, which are
+  stable only from 1.88 onward.
 - An OpenSSH client on `PATH`, with every host reachable over non-interactive SSH (key-based, no password prompt). Windows 10/11 ship this as the optional OpenSSH Client feature; macOS and Linux include it by default.
 
 Ceph nodes:
@@ -216,6 +225,7 @@ admin host:
   sudo -n ceph -s --format json
   sudo -n ceph osd tree --format json
   sudo -n ceph osd df --format json
+  sudo -n ceph osd perf --format json
   sudo -n rados --version
 
 bench command:
@@ -281,6 +291,9 @@ p          run a probe readiness check
 c          edit config
 t/f/r      view osdtrace / kfstrace / radostrace; press again to start or stop (confirmed)
 a          start or stop all trace sources (confirmed)
+m          flow view: the osd -> pg -> object mapping behind the live ops
+o          flow view: order by op count or by latency
+s          flow view: reverse the order
 i          install osdtrace
 x          clear captured trace events
 ?          toggle the help overlay
@@ -312,9 +325,11 @@ The integrated trace panel can show osdtrace, kfstrace, or radostrace data. The 
 On wide terminals the trace panel appears on the right; on tall terminals it
 appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
-host for node readiness. Each stream emits data once per second by default and
-the node table shows connection state (`live`, `dial`, `retry`, `error`), OSD
-ids, CPU percentage, and memory percentage.
+host for node readiness. `refresh_secs` is the pause between ticks, so the
+period an operator sees is that pause plus the time the remote queries take. On
+a four node microceph cluster the cluster stream ticks about every 1.4s at the
+default `refresh_secs = 1`. The node table shows connection state (`live`,
+`dial`, `retry`, `error`), OSD ids, CPU percentage, and memory percentage.
 When `trace_auto_start` is true, cephlens starts osdtrace runners as soon as the
 TUI opens. The default config keeps it false so an operator explicitly starts
 and stops tracing with `t`, `f`, `r`, or `a`.
