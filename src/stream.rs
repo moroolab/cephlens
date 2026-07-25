@@ -40,7 +40,10 @@ elif command -v cephadm >/dev/null 2>&1; then
 elif [ -d /var/lib/rook ]; then
   deployment=rook
 fi
-count=$(pgrep -c '[c]eph-osd' 2>/dev/null || echo 0)
+# pgrep -c prints 0 and exits 1 when nothing matches, so `|| echo 0` would
+# append a second line and break the JSON payload below.
+count=$(pgrep -c '[c]eph-osd' 2>/dev/null || true)
+count=${count:-0}
 ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id \([0-9][0-9]*\).*/\1/p' | paste -sd, -)
 mem_pct=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {avail=$2} END {if (total > 0) printf "%.1f", (total-avail)*100/total; else printf "0.0"}' /proc/meminfo)"#;
 
@@ -100,4 +103,48 @@ pub(crate) fn parse_node_stream_payload(host: &str, payload: &str) -> Result<Nod
         mem_percent: ptr_f64(&value, "/mem_percent"),
         error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: `pgrep -c` exits 1 when nothing matches, so a `|| echo 0`
+    // fallback emitted a second line and produced `"ceph_osd_processes":0\n0`
+    // on every host without ceph-osd processes, such as a mon-only admin node.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_facts_report_osd_count_as_a_bare_integer() {
+        use std::process::Command;
+
+        let script = format!("{NODE_FACTS_SNIPPET}\nprintf '%s' \"$count\"");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sh should be available");
+        assert!(
+            output.status.success(),
+            "node facts snippet failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let count = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()),
+            "ceph_osd_processes must be a bare integer, got {count:?}"
+        );
+    }
+
+    #[test]
+    fn node_stream_payload_parses_a_host_without_osds() {
+        let summary = parse_node_stream_payload(
+            "ceph-admin",
+            r#"{"type":"node","hostname":"ceph-admin","sudo":"ok","ceph_version":"ceph version 19.2.0","deployment":"cephadm","ceph_osd_processes":0,"osd_ids":"","cpu_percent":1.5,"mem_percent":42.0}"#,
+        )
+        .expect("a mon-only node should parse");
+
+        assert_eq!(summary.ceph_osd_processes, 0);
+        assert_eq!(summary.osd_ids, "");
+    }
 }

@@ -6,6 +6,13 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Node readiness no longer breaks on hosts without `ceph-osd` processes. The
+  remote OSD count fell back through `pgrep -c ... || echo 0`, which emitted two
+  lines because `pgrep -c` prints `0` and exits 1 on no match. The extra line
+  made the node stream payload invalid JSON on mon-only hosts.
+
 ## [0.1.4] - 2026-07-07
 
 ### Added
