@@ -5,7 +5,7 @@
 <h1 align="center">CephLens</h1>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)
 [![CI](https://github.com/xtrusia/cephlens/actions/workflows/ci.yml/badge.svg)](https://github.com/xtrusia/cephlens/actions/workflows/ci.yml)
 
 An SSH-driven Ceph investigation TUI with live cluster status, per-node
@@ -60,7 +60,8 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 
 Controller (where the TUI runs):
 
-- Rust 1.85+ (edition 2024) to build.
+- Rust 1.88+ (edition 2024) to build. The source uses let chains, which are
+  stable only from 1.88 onward.
 - An OpenSSH client on `PATH`, with every host reachable over non-interactive SSH (key-based, no password prompt). Windows 10/11 ship this as the optional OpenSSH Client feature; macOS and Linux include it by default.
 
 Ceph nodes:

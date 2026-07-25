@@ -105,13 +105,15 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
     if let Some(cross) = cross_source_insight(&active_rows, input.rados_events) {
         insights.push(cross);
     }
-    if active_rows.is_empty() && input.kfs_events.is_empty() && input.rados_events.is_empty() {
-        if let Some(message) = input.idle_message {
-            insights.push(Insight {
-                level: InsightLevel::Info,
-                text: message.to_owned(),
-            });
-        }
+    if active_rows.is_empty()
+        && input.kfs_events.is_empty()
+        && input.rados_events.is_empty()
+        && let Some(message) = input.idle_message
+    {
+        insights.push(Insight {
+            level: InsightLevel::Info,
+            text: message.to_owned(),
+        });
     }
 
     insights

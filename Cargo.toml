@@ -2,7 +2,7 @@
 name = "cephlens"
 version = "0.1.4"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88.0"
 authors = ["cephlens contributors"]
 description = "A lab-first Ceph investigation TUI with SSH-based status and osdtrace views"
 readme = "README.md"

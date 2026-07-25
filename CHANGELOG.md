@@ -13,6 +13,13 @@ Notable changes are documented here. The format follows
   lines because `pgrep -c` prints `0` and exits 1 on no match. The extra line
   made the node stream payload invalid JSON on mon-only hosts.
 
+### Changed
+
+- Raised the declared minimum supported Rust version to 1.88. The source uses
+  let chains, which are stable only from 1.88, so builds on 1.85 through 1.87
+  failed despite the previous `rust-version = "1.85"`. CI now builds against the
+  declared MSRV.
+
 ## [0.1.4] - 2026-07-07
 
 ### Added
