@@ -313,9 +313,11 @@ The integrated trace panel can show osdtrace, kfstrace, or radostrace data. The 
 On wide terminals the trace panel appears on the right; on tall terminals it
 appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
-host for node readiness. Each stream emits data once per second by default and
-the node table shows connection state (`live`, `dial`, `retry`, `error`), OSD
-ids, CPU percentage, and memory percentage.
+host for node readiness. `refresh_secs` is the pause between ticks, so the
+period an operator sees is that pause plus the time the remote queries take. On
+a four node microceph cluster the cluster stream ticks about every 1.4s at the
+default `refresh_secs = 1`. The node table shows connection state (`live`,
+`dial`, `retry`, `error`), OSD ids, CPU percentage, and memory percentage.
 When `trace_auto_start` is true, cephlens starts osdtrace runners as soon as the
 TUI opens. The default config keeps it false so an operator explicitly starts
 and stops tracing with `t`, `f`, `r`, or `a`.

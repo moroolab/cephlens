@@ -15,6 +15,11 @@ Notable changes are documented here. The format follows
 
 ### Changed
 
+- The cluster status stream now runs its three admin queries at once instead of
+  one after another. On a four node microceph cluster the tick period dropped
+  from 2278ms to 1400ms at the default `refresh_secs = 1`, with the same payload.
+  `refresh_secs` is the pause between ticks, not the period, and the README now
+  says so.
 - `doctor` and `snapshot` now probe hosts concurrently instead of one at a time,
   with at most 8 hosts in flight. Each host still sees one SSH connection at a
   time and the doctor report keeps its previous order.
