@@ -15,6 +15,9 @@ Notable changes are documented here. The format follows
 
 ### Changed
 
+- `doctor` and `snapshot` now probe hosts concurrently instead of one at a time,
+  with at most 8 hosts in flight. Each host still sees one SSH connection at a
+  time and the doctor report keeps its previous order.
 - Raised the declared minimum supported Rust version to 1.88. The source uses
   let chains, which are stable only from 1.88, so builds on 1.85 through 1.87
   failed despite the previous `rust-version = "1.85"`. CI now builds against the

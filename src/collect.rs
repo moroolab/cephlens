@@ -9,7 +9,7 @@ use crate::{
     model::{ClusterSummary, NodeSummary, OsdSummary, Snapshot},
     ssh::ssh_capture,
     stream::NODE_FACTS_SNIPPET,
-    util::{ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
+    util::{MAX_PARALLEL_HOSTS, map_parallel, ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
 };
 
 pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
@@ -26,7 +26,11 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
 
     let cluster = parse_cluster_summary(&status);
     let osds = parse_osds(&tree, &df);
-    let nodes = cfg.hosts.iter().map(|host| collect_node(host)).collect();
+    let nodes = map_parallel(&cfg.hosts, MAX_PARALLEL_HOSTS, |host| collect_node(host))
+        .into_iter()
+        .zip(&cfg.hosts)
+        .map(|(node, host)| node.unwrap_or_else(|| node_worker_panicked(host)))
+        .collect();
 
     Ok(Snapshot {
         captured_at: Utc::now(),
@@ -197,6 +201,14 @@ printf 'mem_percent=%s\n' "$mem_pct"
             error: Some(format!("{err:#}")),
             ..NodeSummary::default()
         },
+    }
+}
+
+fn node_worker_panicked(host: &str) -> NodeSummary {
+    NodeSummary {
+        host: host.to_owned(),
+        error: Some("node collection worker panicked".to_owned()),
+        ..NodeSummary::default()
     }
 }
 
