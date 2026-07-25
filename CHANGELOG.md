@@ -8,6 +8,14 @@ Notable changes are documented here. The format follows
 
 ### Added
 
+- Added a flow view, opened with `m`, that shows the OSD, placement group, and
+  object behind the ops in the trace buffer. radostrace lines already name all
+  three, so the view needs no extra remote command; with only osdtrace running
+  it collapses to OSD and placement group. `o` orders it by op count or by
+  latency and `s` reverses the order. Each row also carries the mean op size,
+  which separates a slow heavy request from one that is slow for the little it
+  asks for. A read reports the length it requested rather than bytes returned,
+  so a client that always asks for 4MiB reports 4MiB whatever the object holds.
 - Insights now name the checks behind a `HEALTH_WARN` or `HEALTH_ERR` instead of
   telling the operator to go run `ceph health detail`. `ceph -s` already carried
   them, so this costs no extra remote command.
@@ -20,6 +28,7 @@ Notable changes are documented here. The format follows
 
 ### Fixed
 
+- `x` now clears every captured trace source rather than osdtrace alone.
 - Node readiness no longer breaks on hosts without `ceph-osd` processes. The
   remote OSD count fell back through `pgrep -c ... || echo 0`, which emitted two
   lines because `pgrep -c` prints `0` and exits 1 on no match. The extra line

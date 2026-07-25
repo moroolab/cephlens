@@ -14,6 +14,7 @@ use crate::app::{
 };
 use crate::diagnose::{DiagnoseInput, Insight, InsightLevel, diagnose, format_latency_us};
 use crate::editor::ConfigDraft;
+use crate::flow::{FlowRow, FlowSource, FlowTree, build_flow_tree, flow_totals};
 use crate::kfstrace::kfs_op_rows;
 use crate::radostrace::rados_pool_rows;
 use crate::trace::{TraceGraphRow, trace_graph_rows as build_trace_graph_rows};
@@ -419,11 +420,22 @@ fn command_spans(commands: &[(&'static str, &'static str)]) -> Vec<Span<'static>
 
 fn footer_commands(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.mode {
+        Mode::Live if app.flow_view => vec![
+            ("m", "graph"),
+            ("o", "ops/lat"),
+            ("s", "sort"),
+            ("r", "rados"),
+            ("t", "osd"),
+            ("Tab", "panel"),
+            ("?", "more"),
+            ("q", "quit"),
+        ],
         Mode::Live => vec![
             ("t", "osd"),
             ("f", "kfs"),
             ("r", "rados"),
             ("a", "all"),
+            ("m", "flow"),
             ("c", "config"),
             ("Tab", "panel"),
             ("?", "more"),
@@ -457,6 +469,9 @@ fn help_commands(app: &App) -> Vec<(&'static str, &'static str)> {
                 "view osd / kfs / rados; press again to start/stop",
             ),
             ("a", "start or stop all trace sources"),
+            ("m", "flow view: osd -> pg -> object mapping"),
+            ("o", "flow: order by ops or latency"),
+            ("s", "flow: reverse the order"),
             ("x", "clear captured trace"),
             ("Tab / Shift+Tab", "focus next / prev panel"),
             ("Up/Dn j/k", "scroll focused panel"),
@@ -744,6 +759,10 @@ fn draw_kfstrace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.flow_view {
+        draw_flow(frame, app, area);
+        return;
+    }
     if app.trace_source == TraceSource::Kfstrace {
         draw_kfstrace_events(frame, app, area);
         return;
@@ -877,6 +896,175 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )),
         area,
     );
+}
+
+/// Renders the OSD to PG to object tree. Terminal cells make curved edges
+/// unreadable, so the fan out is drawn with box characters and every branch is
+/// ordered by the active metric.
+fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    const MAX_OSDS: usize = 12;
+    const MAX_CHILDREN: usize = 6;
+
+    let tree = build_flow_tree(
+        &app.radostrace_events,
+        &app.trace_events,
+        &host_by_osd_id(app),
+        app.flow_metric,
+        app.flow_sort,
+        MAX_OSDS,
+        MAX_CHILDREN,
+    );
+    let visible = table_visible_rows(area);
+    let total = tree.rows.len();
+    let scroll = clamp_top_scroll(app.flow_scroll, total, visible);
+    let compact = area.width < 88;
+
+    let rows = tree
+        .rows
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| flow_table_row(row, compact));
+    let widths = if compact {
+        vec![
+            Constraint::Min(20),
+            Constraint::Length(6),
+            Constraint::Length(9),
+        ]
+    } else {
+        vec![
+            Constraint::Min(24),
+            Constraint::Length(11),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ]
+    };
+    let header = if compact {
+        Row::new(vec!["OSD / PG / Object", "Ops", "Max"])
+    } else {
+        Row::new(vec![
+            "OSD / PG / Object",
+            "Host / Acting",
+            "Ops",
+            "Avg",
+            "Max",
+            "Avg size",
+        ])
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header.style(Style::default().fg(MUTED).bold()))
+        .style(Style::default().fg(TEXT))
+        .block(scroll_panel(
+            app,
+            PanelFocus::Trace,
+            &flow_panel_title(app, &tree),
+            total,
+            visible,
+            scroll,
+            false,
+            resize_hint(app, PanelFocus::Trace, area),
+        ));
+    frame.render_widget(table, area);
+
+    if total == 0 {
+        let hint = match tree.source {
+            FlowSource::Empty => flow_empty_hint(app),
+            _ => "no mapped ops in the trace buffer",
+        };
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 2,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(MUTED).italic(),
+            ))),
+            inner,
+        );
+    }
+}
+
+/// Names the level the tree reached and the active ordering, so the panel says
+/// why it has two levels instead of three.
+fn flow_panel_title(app: &App, tree: &FlowTree) -> String {
+    let level = match tree.source {
+        FlowSource::Rados => "osd/pg/object",
+        FlowSource::Osd => "osd/pg",
+        FlowSource::Empty => "idle",
+    };
+    let totals = flow_totals(&tree.rows);
+    format!(
+        "flow {level} by {} {} ({} ops)",
+        app.flow_metric.label(),
+        app.flow_sort.label(),
+        totals.ops
+    )
+}
+
+fn flow_empty_hint(app: &App) -> &'static str {
+    if app.trace_active > 0 || app.radostrace_active > 0 {
+        "tracing, but no op has been seen yet; the cluster may be idle"
+    } else {
+        "press r for radostrace (object level) or t for osdtrace (PG level)"
+    }
+}
+
+/// Objects fan in to a PG and PGs fan in to an OSD, so the tree is drawn as a
+/// fan out from the OSD. Left to right that reads OSD, PG, object, which is the
+/// same chain the mapping follows.
+fn flow_table_row(row: &FlowRow, compact: bool) -> Row<'static> {
+    let (indent, color) = match row.depth {
+        0 => (String::new(), ACCENT),
+        1 => (
+            format!("  {} ", if row.last_child { "└─" } else { "├─" }),
+            BLUE,
+        ),
+        _ => (
+            format!("      {} ", if row.last_child { "└─" } else { "├─" }),
+            TEXT,
+        ),
+    };
+    let label = Cell::from(format!("{indent}{}", row.label)).style(if row.depth == 0 {
+        Style::default().fg(color).bold()
+    } else {
+        Style::default().fg(color)
+    });
+    let ops = Cell::from(row.stats.ops.to_string()).style(trace_ops_style(row.stats.ops));
+    let max = Cell::from(format_latency_us(row.stats.max_us))
+        .style(Style::default().fg(latency_color(row.stats.max_us)));
+
+    if compact {
+        Row::new(vec![label, ops, max])
+    } else {
+        Row::new(vec![
+            label,
+            Cell::from(short(&row.detail, 11)).style(Style::default().fg(MUTED)),
+            ops,
+            Cell::from(format_latency_us(row.stats.avg_us())),
+            max,
+            Cell::from(format_compact_bytes(row.stats.avg_bytes()))
+                .style(Style::default().fg(MUTED)),
+        ])
+    }
+}
+
+fn host_by_osd_id(app: &App) -> HashMap<i64, String> {
+    app.snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .osds
+                .iter()
+                .map(|osd| (osd.id, osd.host.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn trace_panel_title(app: &App) -> &'static str {

@@ -23,6 +23,7 @@ mod config;
 mod diagnose;
 mod doctor;
 mod editor;
+mod flow;
 mod kfstrace;
 mod lab;
 mod model;
@@ -52,6 +53,7 @@ use doctor::run_doctor;
 use editor::{
     ConfigDraft, ConfigEditor, handle_config_input, handle_config_key, open_config_editor,
 };
+use flow::{FlowMetric, FlowSort};
 use lab::{LabTrace, run_lab};
 use report::build_report;
 use runner::{CleanupResult, report_cleanup_results};
@@ -401,6 +403,10 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
         trace_following: false,
         trace_session: None,
         trace_source: TraceSource::Osdtrace,
+        flow_view: false,
+        flow_metric: FlowMetric::Latency,
+        flow_sort: FlowSort::Descending,
+        flow_scroll: 0,
         kfstrace_events: Vec::new(),
         kfstrace_active: 0,
         kfstrace_stop: Arc::new(AtomicBool::new(false)),
@@ -491,6 +497,10 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         trace_following: false,
         trace_session: None,
         trace_source: TraceSource::Osdtrace,
+        flow_view: false,
+        flow_metric: FlowMetric::Latency,
+        flow_sort: FlowSort::Descending,
+        flow_scroll: 0,
         kfstrace_events: Vec::new(),
         kfstrace_active: 0,
         kfstrace_stop: Arc::new(AtomicBool::new(false)),
@@ -666,9 +676,29 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 Ok(false)
             }
             KeyCode::Char('x') => {
+                // Every captured source, not just osdtrace. The flow panel
+                // draws from all of them, so a partial clear left it showing
+                // events the operator meant to drop.
                 app.trace_events.clear();
                 app.trace_series.clear();
-                app.log("trace graph cleared");
+                app.kfstrace_events.clear();
+                app.radostrace_events.clear();
+                app.log("captured trace cleared");
+                Ok(false)
+            }
+            KeyCode::Char('m') => {
+                app.flow_view = !app.flow_view;
+                app.flow_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::Char('o') if app.flow_view => {
+                app.flow_metric = app.flow_metric.toggled();
+                app.flow_scroll = 0;
+                Ok(false)
+            }
+            KeyCode::Char('s') if app.flow_view => {
+                app.flow_sort = app.flow_sort.toggled();
+                app.flow_scroll = 0;
                 Ok(false)
             }
             _ => Ok(false),
@@ -808,6 +838,9 @@ fn focused_scroll_mut(app: &mut App) -> &mut usize {
     match app.focused_panel {
         PanelFocus::Nodes => &mut app.nodes_scroll,
         PanelFocus::Osds => &mut app.osds_scroll,
+        // The flow view replaces the trace panel, so the trace focus scrolls
+        // whichever of the two is on screen.
+        PanelFocus::Trace if app.flow_view => &mut app.flow_scroll,
         PanelFocus::Trace => &mut app.trace_scroll,
         PanelFocus::Logs => &mut app.logs_scroll,
     }
@@ -847,14 +880,19 @@ fn handle_quit_confirm(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn request_source(app: &mut App, source: TraceSource) {
-    if app.trace_source != source {
+    // The flow panel merges every source, so it has no selected one and the
+    // first press would look like a key that did nothing.
+    if app.trace_source != source && !app.flow_view {
         // switch the panel to this source first; do not start/stop yet
         app.trace_source = source;
-    } else if source_running(app, source) {
-        app.pending_trace_action = Some(TraceAction::Stop(source));
-    } else {
-        app.pending_trace_action = Some(TraceAction::Start(source));
+        return;
     }
+    app.trace_source = source;
+    app.pending_trace_action = Some(if source_running(app, source) {
+        TraceAction::Stop(source)
+    } else {
+        TraceAction::Start(source)
+    });
 }
 
 fn handle_trace_confirm(app: &mut App, key: KeyEvent) {

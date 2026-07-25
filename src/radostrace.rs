@@ -8,6 +8,15 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 pub(crate) struct RadosEvent {
     pub(crate) pool: String,
+    /// Full `pool.seq` placement group id built from the pool and pg columns.
+    pub(crate) pg: String,
+    /// Acting set for the PG, primary first.
+    pub(crate) acting: Vec<i64>,
+    pub(crate) object: String,
+    /// Size the op declared, in bytes. A write reports the data it writes. A
+    /// read reports the length it asked for, which can exceed what the object
+    /// holds, so this is the weight of the request rather than bytes moved.
+    pub(crate) size_bytes: u64,
     pub(crate) write: bool,
     pub(crate) latency_us: u64,
 }
@@ -35,9 +44,25 @@ pub(crate) fn parse_rados_event(line: &str) -> Option<RadosEvent> {
     };
     Some(RadosEvent {
         pool: tokens[3].to_owned(),
+        pg: format!("{}.{}", tokens[3], tokens[4]),
+        acting: parse_acting(tokens[5]),
+        object: tokens[9].to_owned(),
+        size_bytes: tokens[7].parse().unwrap_or_default(),
         write,
         latency_us: tokens[8].parse::<u64>().ok()?,
     })
+}
+
+/// Parses the `[4,2,3]` acting set column. The first entry is the primary. A
+/// missing slot is reported as `-1` by Ceph and is kept so the set still lines
+/// up with what the cluster reported.
+fn parse_acting(token: &str) -> Vec<i64> {
+    token
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|entry| entry.trim().parse::<i64>().ok())
+        .collect()
 }
 
 pub(crate) fn rados_pool_rows(events: &[RadosEvent]) -> Vec<RadosPoolRow> {
@@ -87,6 +112,10 @@ mod tests {
         assert_eq!(write.pool, "2");
         assert!(write.write);
         assert_eq!(write.latency_us, 9023);
+        assert_eq!(write.pg, "2.2");
+        assert_eq!(write.acting, vec![4, 2, 3]);
+        assert_eq!(write.object, "bench_object7");
+        assert_eq!(write.size_bytes, 4096);
 
         let read = parse_rados_event(
             "   4210   771   3   5   1e   [1,2,3]   R   4096   412   obj [read][0, 4096]",
@@ -95,6 +124,9 @@ mod tests {
         assert_eq!(read.pool, "5");
         assert!(!read.write);
         assert_eq!(read.latency_us, 412);
+        assert_eq!(read.pg, "5.1e");
+        assert_eq!(read.object, "obj", "reads name the object too");
+        assert_eq!(read.size_bytes, 4096);
     }
 
     #[test]

@@ -31,6 +31,9 @@ pub(crate) struct TraceEvent {
     pub(crate) osd: String,
     pub(crate) pg: String,
     pub(crate) op: String,
+    /// Size the op declared, in bytes, from the `size` column. A read reports
+    /// the requested length rather than the bytes returned.
+    pub(crate) size_bytes: u64,
     pub(crate) op_lat_us: u64,
     pub(crate) throttle_lat_us: u64,
     pub(crate) recv_lat_us: u64,
@@ -471,6 +474,7 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
             queue_lat_us: 0,
             bluestore_lat_us: 0,
             kv_commit_us: 0,
+            size_bytes: 0,
             raw: error.trim().to_owned(),
         });
     }
@@ -484,6 +488,9 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
         osd,
         pg,
         op: op.to_owned(),
+        size_bytes: token_after(trimmed, "size")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
         op_lat_us: token_after(trimmed, "op_lat")
             .or_else(|| token_after(trimmed, "subop_lat"))
             .and_then(|value| value.parse().ok())
@@ -841,6 +848,26 @@ mod tests {
         assert_eq!(event.queue_lat_us, 17);
         assert_eq!(event.bluestore_lat_us, 19);
         assert_eq!(event.kv_commit_us, 23);
+        assert_eq!(event.size_bytes, 0, "this build emits no size column");
+    }
+
+    // Captured from cephtrace v1.6 osdtrace against ceph 19.2.3. The size column
+    // separates an op that is slow because it moves 4MiB from one that is slow
+    // for a few kilobytes.
+    #[test]
+    fn parse_trace_event_reads_the_op_size() {
+        let event = parse_trace_event(
+            "node-a",
+            "osd 2 pg 3.4 op_r size 4194304 client 435873 tid 1 throttle_lat 1 recv_lat 7 dispatch_lat 15 queue_lat 57 osd_lat 47 bluestore_lat 191 op_lat 319",
+        )
+        .expect("trace event should parse");
+
+        assert_eq!(event.osd, "2");
+        assert_eq!(event.pg, "3.4");
+        assert_eq!(event.op, "op_r");
+        assert_eq!(event.size_bytes, 4_194_304);
+        assert_eq!(event.op_lat_us, 319);
+        assert_eq!(event.bluestore_lat_us, 191);
     }
 
     #[test]

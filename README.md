@@ -55,6 +55,11 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 - Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
   numbers, and health check names read straight out of `ceph -s`.
 - osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
+- A flow view of the OSD, placement group, and object behind the observed
+  ops, built from the trace lines already streaming. radostrace names the
+  object so the view has three levels; with only osdtrace it collapses to
+  OSD and placement group. Rows carry the mean op size next to the latency; a
+  read reports the length it requested, not the bytes returned.
 - No standing agent: no permanent daemon on the nodes; the osdtrace runner script removes itself on stop, quit, or TTL expiry. (The cephtrace tracer binaries you deploy do persist under `~/.cephlens/bin/`.)
 - Edit hosts and trace settings live in the TUI; changes apply to open SSH streams immediately.
 - Export recorded sessions as Markdown reports with the same diagnostic rules used by the TUI.
@@ -286,6 +291,9 @@ p          run a probe readiness check
 c          edit config
 t/f/r      view osdtrace / kfstrace / radostrace; press again to start or stop (confirmed)
 a          start or stop all trace sources (confirmed)
+m          flow view: the osd -> pg -> object mapping behind the live ops
+o          flow view: order by op count or by latency
+s          flow view: reverse the order
 i          install osdtrace
 x          clear captured trace events
 ?          toggle the help overlay
