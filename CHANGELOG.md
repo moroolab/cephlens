@@ -6,6 +6,15 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-26
+
+### Changed
+
+- The OSD map state column now combines daemon state and CRUSH membership as
+  `up/in`, `up/out`, `down/in`, or `down/out`.
+- The dashboard header shows the running version instead of repeating the
+  project name.
+
 ## [0.1.6] - 2026-07-26
 
 ### Added
@@ -127,7 +136,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/xtrusia/cephlens/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xtrusia/cephlens/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xtrusia/cephlens/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/xtrusia/cephlens/compare/v0.1.3...v0.1.4
