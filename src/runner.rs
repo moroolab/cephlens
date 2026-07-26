@@ -3,7 +3,7 @@ use std::{process::Command as ProcessCommand, thread};
 use crate::{
     ssh::ssh_capture,
     trace::{TraceInstallConfig, TraceTarget, parse_trace_target, trace_install_command},
-    util::{shell_quote, short},
+    util::{remote_pidfile_cleanup_functions, shell_quote, short},
 };
 
 #[derive(Clone, Debug)]
@@ -109,33 +109,22 @@ pub(crate) fn report_cleanup_results(results: &[CleanupResult]) {
 
 fn trace_runner_cleanup_command(session: &str) -> String {
     let safe_session = safe_session_id(session);
+    trace_runner_cleanup_for_glob(&format!(
+        "\"$HOME/.cache/cephlens/runner/cephlens-runner-{safe_session}.pid\""
+    ))
+}
+
+fn trace_runner_cleanup_for_glob(pidfile_glob: &str) -> String {
     format!(
         r#"
-runner="$HOME/.cache/cephlens/runner/cephlens-runner-{safe_session}.sh"
-pidfile="$HOME/.cache/cephlens/runner/cephlens-runner-{safe_session}.pid"
-pids=""
-if [ -f "$pidfile" ]; then
-  pids=$(cat "$pidfile" 2>/dev/null || true)
-fi
-if [ -n "$pids" ]; then
-  for pid in $pids; do
-    children=$(pgrep -P "$pid" 2>/dev/null || true)
-    if [ -n "$children" ]; then
-      kill -TERM $children 2>/dev/null || true
-    fi
-    kill -TERM "$pid" 2>/dev/null || true
-  done
-  sleep 1
-  for pid in $pids; do
-    children=$(pgrep -P "$pid" 2>/dev/null || true)
-    if [ -n "$children" ]; then
-      kill -KILL $children 2>/dev/null || true
-    fi
-    kill -KILL "$pid" 2>/dev/null || true
-  done
-fi
-rm -f "$runner" "$pidfile" 2>/dev/null || true
-"#
+{cleanup_functions}
+for pidfile in {pidfile_glob}; do
+  [ -f "$pidfile" ] || continue
+  runner="${{pidfile%.pid}}.sh"
+  cephlens_cleanup_pidfile "$pidfile" "$runner" "$runner"
+done
+"#,
+        cleanup_functions = remote_pidfile_cleanup_functions(),
     )
 }
 
@@ -199,19 +188,25 @@ pub(crate) fn trace_runner_install_command(
     session: &str,
     latency_ms: u64,
     ttl_secs: u64,
+    watch_connection: bool,
 ) -> String {
     let safe_session = safe_session_id(session);
+    let cleanup =
+        trace_runner_cleanup_for_glob("\"$HOME\"/.cache/cephlens/runner/cephlens-runner-*.pid");
+    let script = shell_quote(trace_runner_script());
+    let watch_connection = u8::from(watch_connection);
     format!(
         r#"
 set -eu
+{cleanup}
 dir="$HOME/.cache/cephlens/runner"
 mkdir -p "$dir"
 runner="$dir/cephlens-runner-{safe_session}.sh"
 pidfile="$dir/cephlens-runner-{safe_session}.pid"
-cat > "$runner"
+printf '%s' {script} > "$runner"
 chmod 700 "$runner"
 echo "__CEPHLENS_RUNNER__ installed $runner"
-exec "$runner" {latency_ms} {ttl_secs} "$pidfile"
+exec "$runner" {latency_ms} {ttl_secs} "$pidfile" {watch_connection}
 "#
     )
 }
@@ -221,9 +216,11 @@ pub(crate) fn trace_runner_script() -> &'static str {
 latency_ms="${1:-1}"
 ttl_secs="${2:-1800}"
 pidfile="${3:-}"
+watch_connection="${4:-0}"
 runner_path="$0"
 trace_pid=""
 ttl_pid=""
+connection_pid=""
 
 if [ -n "$pidfile" ]; then
   printf '%s\n' "$$" > "$pidfile"
@@ -235,8 +232,14 @@ cleanup() {
   if [ -n "$ttl_pid" ]; then
     kill "$ttl_pid" 2>/dev/null || true
   fi
+  if [ -n "$connection_pid" ]; then
+    kill "$connection_pid" 2>/dev/null || true
+  fi
   if [ -n "$trace_pid" ]; then
-    kill "$trace_pid" 2>/dev/null || sudo -n kill "$trace_pid" 2>/dev/null || true
+    trace_pids=$(cephlens_process_tree "$trace_pid")
+    for target_pid in $trace_pids; do
+      sudo -n kill -TERM "$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null || true
+    done
     wait "$trace_pid" 2>/dev/null || true
   fi
   rm -f "$runner_path" 2>/dev/null || true
@@ -251,6 +254,25 @@ cleanup() {
 
 trap cleanup INT TERM HUP EXIT
 echo "__CEPHLENS_RUNNER__ starting ttl=${ttl_secs}s latency_ms=${latency_ms}" >&2
+
+cephlens_process_tree() {
+  root_pid=$1
+  printf '%s\n' "$root_pid"
+  for child_pid in $(pgrep -P "$root_pid" 2>/dev/null || true); do
+    cephlens_process_tree "$child_pid"
+  done
+}
+
+if [ "$watch_connection" = "1" ]; then
+  parent_pid=$$
+  exec 3<&0
+  (
+    while IFS= read -r _ <&3; do :; done
+    kill -TERM "$parent_pid" 2>/dev/null || true
+  ) &
+  connection_pid=$!
+  exec 3<&-
+fi
 
 if ! sudo -n true 2>/dev/null; then
   echo "__CEPHLENS_TRACE_ERROR__ sudo -n unavailable"
@@ -315,5 +337,15 @@ mod tests {
 
         assert!(script.contains("echo \"__CEPHLENS_RUNNER__ ttl expired\" >&2"));
         assert!(script.contains("echo \"__CEPHLENS_RUNNER__ osdtrace_pid=$trace_pid\" >&2"));
+    }
+
+    #[test]
+    fn trace_runner_replaces_stale_runner_and_watches_connection() {
+        let command = trace_runner_install_command("new-session", 1, 30, true);
+        let script = trace_runner_script();
+
+        assert!(command.contains("cephlens-runner-*.pid"));
+        assert!(script.contains("while IFS= read -r"));
+        assert!(script.contains("cephlens_process_tree \"$trace_pid\""));
     }
 }

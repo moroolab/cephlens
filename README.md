@@ -256,9 +256,12 @@ trace path placeholders:
 ```
 
 The osdtrace runner script is written under
-`~/.cache/cephlens/runner/cephlens-runner-*.sh` on each remote host and is
-removed on stop, quit, or TTL expiry. The optional downloaded `osdtrace` binary
-is stored under `~/.cephlens/bin/osdtrace`.
+`~/.cache/cephlens/runner/cephlens-runner-*.sh` on each remote host. Interactive
+trace runners watch the SSH connection and remove their tracer process tree and
+runner files when that connection closes. Starting a tracer also removes a
+matching runner left by an older interrupted session. TTL expiry remains the
+fallback when SSH has not detected a network failure. The optional downloaded
+`osdtrace` binary is stored under `~/.cephlens/bin/osdtrace`.
 
 Automatic `osdtrace` download is disabled unless `osdtrace_url` is configured.
 When a download is required, cephlens requires `osdtrace_sha256` and verifies the

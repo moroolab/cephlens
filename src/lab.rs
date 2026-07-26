@@ -11,7 +11,7 @@ use crate::{
     collect::{collect_snapshot, run_bench},
     config::ResolvedConfig,
     report::build_report,
-    runner::{trace_runner_install_command, trace_runner_script},
+    runner::trace_runner_install_command,
     session::{
         TRACE_KFS_LOG, TRACE_OSD_LOG, TRACE_RADOS_LOG, append_snapshot, append_trace_line,
         create_session_dir, session_snapshot_path,
@@ -55,8 +55,8 @@ pub(crate) fn run_lab(
                 session_dir.clone(),
                 host.clone(),
                 TRACE_OSD_LOG,
-                trace_runner_install_command(&session, cfg.trace_latency_ms, trace_ttl_secs),
-                Some(trace_runner_script().to_owned()),
+                trace_runner_install_command(&session, cfg.trace_latency_ms, trace_ttl_secs, false),
+                None,
                 "__CEPHLENS_TRACE_ERROR__",
             ));
         }

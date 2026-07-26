@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    process::{Command as ProcessCommand, Stdio},
+    process::{ChildStdin, Command as ProcessCommand, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,7 +25,7 @@ use crate::{
     radostrace::{RadosEvent, parse_rados_event},
     runner::{
         CleanupResult, cleanup_trace_runners_async, cleanup_trace_runners_wait, install_trace_host,
-        probe_trace_host, trace_runner_install_command, trace_runner_script, trace_threshold_label,
+        probe_trace_host, trace_runner_install_command, trace_threshold_label,
     },
     session::{
         TRACE_KFS_LOG, TRACE_OSD_LOG, TRACE_RADOS_LOG, append_snapshot, append_trace_line,
@@ -1021,7 +1021,7 @@ fn spawn_client_trace_runner(
             .arg("--")
             .arg(&host)
             .arg(remote)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -1033,6 +1033,7 @@ fn spawn_client_trace_runner(
                 return;
             }
         };
+        let connection = spawn_connection_heartbeat(child.stdin.take(), Arc::clone(&stop));
 
         let mut readers = Vec::new();
         if let Some(stderr) = child.stderr.take() {
@@ -1072,6 +1073,7 @@ fn spawn_client_trace_runner(
             }
         }
 
+        join_connection_heartbeat(connection);
         let _ = child.wait();
         for reader in readers {
             let _ = reader.join();
@@ -1158,7 +1160,7 @@ fn spawn_trace_runner(
     stop: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let command = trace_runner_install_command(&session, latency_ms, ttl_secs);
+        let command = trace_runner_install_command(&session, latency_ms, ttl_secs, true);
         let remote = format!("sh -c {}", shell_quote(&command));
         let child_result = ProcessCommand::new("ssh")
             .args([
@@ -1190,16 +1192,7 @@ fn spawn_trace_runner(
             }
         };
 
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(err) = stdin.write_all(trace_runner_script().as_bytes())
-        {
-            let _ = child.kill();
-            let _ = tx.send(WorkerMsg::TraceDone {
-                host,
-                message: format!("failed to upload runner: {err}"),
-            });
-            return;
-        }
+        let connection = spawn_connection_heartbeat(child.stdin.take(), Arc::clone(&stop));
 
         if let Some(stderr) = child.stderr.take() {
             let err_tx = tx.clone();
@@ -1260,6 +1253,7 @@ fn spawn_trace_runner(
                 Ok(None) => thread::sleep(Duration::from_millis(100)),
             }
         };
+        join_connection_heartbeat(connection);
         while let Ok(line) = line_rx.try_recv() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -1271,6 +1265,28 @@ fn spawn_trace_runner(
         }
         let _ = tx.send(WorkerMsg::TraceDone { host, message });
     });
+}
+
+fn spawn_connection_heartbeat(
+    stdin: Option<ChildStdin>,
+    stop: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    stdin.map(|mut stdin| {
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if stdin.write_all(b"\n").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+    })
+}
+
+fn join_connection_heartbeat(handle: Option<thread::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
 }
 
 fn record_trace_event(app: &mut App, event: &TraceEvent) {
