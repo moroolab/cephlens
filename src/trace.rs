@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 
 use crate::model::Snapshot;
-use crate::util::shell_quote;
+use crate::util::{remote_pidfile_cleanup_functions, shell_quote};
 
 pub(crate) const TRACE_BUCKET_SECS: i64 = 2;
 
@@ -246,32 +246,20 @@ pub(crate) fn radostrace_run_command_with_session(ttl_secs: u64, session: Option
 
 pub(crate) fn client_tracer_cleanup_command(tool: &str, session: &str) -> String {
     let pidfile = client_tracer_pidfile(tool, session);
+    client_tracer_cleanup_for_glob(&pidfile)
+}
+
+fn client_tracer_cleanup_for_glob(pidfile_glob: &str) -> String {
     format!(
         r#"
-pidfile={pidfile}
-pids=""
-if [ -f "$pidfile" ]; then
-  pids=$(cat "$pidfile" 2>/dev/null || true)
-fi
-if [ -n "$pids" ]; then
-  for pid in $pids; do
-    children=$(pgrep -P "$pid" 2>/dev/null || true)
-    if [ -n "$children" ]; then
-      sudo -n kill -TERM $children 2>/dev/null || kill -TERM $children 2>/dev/null || true
-    fi
-    sudo -n kill -TERM "$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  done
-  sleep 1
-  for pid in $pids; do
-    children=$(pgrep -P "$pid" 2>/dev/null || true)
-    if [ -n "$children" ]; then
-      sudo -n kill -KILL $children 2>/dev/null || kill -KILL $children 2>/dev/null || true
-    fi
-    sudo -n kill -KILL "$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  done
-fi
-rm -f "$pidfile" 2>/dev/null || true
-"#
+{cleanup_functions}
+for pidfile in {pidfile_glob}; do
+  [ -f "$pidfile" ] || continue
+  process_marker=$(basename "$pidfile" .pid)
+  cephlens_cleanup_pidfile "$pidfile" "$process_marker" ""
+done
+"#,
+        cleanup_functions = remote_pidfile_cleanup_functions(),
     )
 }
 
@@ -281,11 +269,27 @@ fn client_tracer_run_command(
     error_prefix: &str,
     session: Option<&str>,
 ) -> String {
-    let pidfile = session
-        .map(|session| client_tracer_pidfile(tool, session))
-        .unwrap_or_else(|| "''".to_owned());
+    let (pidfile, stale_cleanup, connection_watch) = session
+        .map(|session| {
+            (
+                client_tracer_pidfile(tool, session),
+                client_tracer_cleanup_for_glob(&format!(
+                    "\"$HOME\"/.cache/cephlens/runner/cephlens-{tool}-*.pid"
+                )),
+                r#"parent_pid=$$
+exec 3<&0
+(
+  while IFS= read -r _ <&3; do :; done
+  kill -TERM "$parent_pid" 2>/dev/null || true
+) &
+connection_pid=$!
+exec 3<&-"#,
+            )
+        })
+        .unwrap_or_else(|| ("''".to_owned(), String::new(), ""));
     format!(
         r#"
+{stale_cleanup}
 bin=$(command -v {tool} 2>/dev/null || true)
 if [ -z "$bin" ] && [ -x "$HOME/.cephlens/bin/{tool}" ]; then
   bin="$HOME/.cephlens/bin/{tool}"
@@ -304,9 +308,13 @@ if [ -n "$pidfile" ]; then
   printf '%s\n' "$$" > "$pidfile"
 fi
 trace_pid=""
+connection_pid=""
 cleanup() {{
   code=$?
   trap - INT TERM HUP EXIT
+  if [ -n "$connection_pid" ]; then
+    kill "$connection_pid" 2>/dev/null || true
+  fi
   if [ -n "$trace_pid" ]; then
     children=$(pgrep -P "$trace_pid" 2>/dev/null || true)
     if [ -n "$children" ]; then
@@ -324,6 +332,7 @@ cleanup() {{
   exit "$code"
 }}
 trap cleanup INT TERM HUP EXIT
+{connection_watch}
 sudo -n "$bin" {args} 2>&1 &
 trace_pid=$!
 wait "$trace_pid"
@@ -954,6 +963,19 @@ mod tests {
         assert!(kfs.contains("sudo -n \"$bin\" -m mds -l 1000 -t 30"));
         assert!(rados.contains("sudo -n \"$bin\" -t 30"));
         assert!(rados.contains("130|143) code=0"));
+    }
+
+    #[test]
+    fn interactive_client_tracers_replace_stale_runs_and_watch_connection() {
+        let kfs = kfstrace_run_command_with_session(1000, 30, Some("new-session"));
+        let rados = radostrace_run_command_with_session(30, Some("new-session"));
+
+        assert!(kfs.contains("cephlens-kfstrace-*.pid"));
+        assert!(rados.contains("cephlens-radostrace-*.pid"));
+        assert!(kfs.contains("while IFS= read -r _ <&3"));
+        assert!(rados.contains("while IFS= read -r _ <&3"));
+        assert!(!kfstrace_run_command(1000, 30).contains("while IFS= read -r _ <&3"));
+        assert!(!radostrace_run_command(30).contains("while IFS= read -r _ <&3"));
     }
 
     #[test]

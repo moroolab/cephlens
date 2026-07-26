@@ -6,6 +6,15 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-26
+
+### Fixed
+
+- OSD and client tracers now stop and remove their remote runner files when the
+  controlling SSH connection closes, including forced TUI termination.
+- Starting a tracer removes matching runner processes left by an interrupted
+  earlier session.
+
 ## [0.1.7] - 2026-07-26
 
 ### Changed
@@ -136,7 +145,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/xtrusia/cephlens/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xtrusia/cephlens/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xtrusia/cephlens/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xtrusia/cephlens/compare/v0.1.4...v0.1.5

@@ -48,6 +48,61 @@ pub(crate) fn shell_quote(input: &str) -> String {
     out
 }
 
+pub(crate) fn remote_pidfile_cleanup_functions() -> &'static str {
+    r#"cephlens_process_tree() {
+  root_pid=$1
+  printf '%s\n' "$root_pid"
+  for child_pid in $(pgrep -P "$root_pid" 2>/dev/null || true); do
+    cephlens_process_tree "$child_pid"
+  done
+}
+cephlens_pid_start_time() {
+  sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+cephlens_cleanup_pidfile() {
+  cleanup_pidfile=$1
+  process_marker=$2
+  companion_file=${3:-}
+  cleanup_pid=$(cat "$cleanup_pidfile" 2>/dev/null || true)
+  case "$cleanup_pid" in
+    ''|*[!0-9]*) cleanup_pid="" ;;
+  esac
+  if [ -n "$cleanup_pid" ] && kill -0 "$cleanup_pid" 2>/dev/null; then
+    cleanup_cmdline=$(tr '\000' ' ' < "/proc/$cleanup_pid/cmdline" 2>/dev/null || true)
+    case "$cleanup_cmdline" in
+      *"$process_marker"*)
+        cleanup_pids=$(cephlens_process_tree "$cleanup_pid")
+        cleanup_targets=""
+        for target_pid in $cleanup_pids; do
+          target_start=$(cephlens_pid_start_time "$target_pid")
+          if [ -n "$target_start" ]; then
+            cleanup_targets="$cleanup_targets $target_pid:$target_start"
+          fi
+        done
+        for target in $cleanup_targets; do
+          target_pid=${target%%:*}
+          target_start=${target#*:}
+          [ "$(cephlens_pid_start_time "$target_pid")" = "$target_start" ] || continue
+          sudo -n kill -TERM "$target_pid" 2>/dev/null || kill -TERM "$target_pid" 2>/dev/null || true
+        done
+        sleep 1
+        for target in $cleanup_targets; do
+          target_pid=${target%%:*}
+          target_start=${target#*:}
+          [ "$(cephlens_pid_start_time "$target_pid")" = "$target_start" ] || continue
+          sudo -n kill -KILL "$target_pid" 2>/dev/null || kill -KILL "$target_pid" 2>/dev/null || true
+        done
+        ;;
+    esac
+  fi
+  rm -f "$cleanup_pidfile" 2>/dev/null || true
+  if [ -n "$companion_file" ]; then
+    rm -f "$companion_file" 2>/dev/null || true
+  fi
+}
+"#
+}
+
 pub(crate) fn short(value: &str, len: usize) -> String {
     value.chars().take(len).collect()
 }
@@ -97,6 +152,18 @@ mod tests {
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("echo hello"), "'echo hello'");
         assert_eq!(shell_quote("printf 'x'"), "'printf '\\''x'\\'''");
+    }
+
+    #[test]
+    fn remote_cleanup_revalidates_process_identity_before_each_signal() {
+        let functions = remote_pidfile_cleanup_functions();
+
+        assert_eq!(
+            functions
+                .matches("[ \"$(cephlens_pid_start_time \"$target_pid\")\" = \"$target_start\" ]")
+                .count(),
+            2
+        );
     }
 
     #[test]
