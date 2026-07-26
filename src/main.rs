@@ -55,6 +55,7 @@ use editor::{
 };
 use flow::{FlowMetric, FlowSort};
 use lab::{LabTrace, run_lab};
+use model::DEFAULT_TRACE_WINDOW_SECS;
 use report::build_report;
 use runner::{CleanupResult, report_cleanup_results};
 use session::{
@@ -322,7 +323,7 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedConfig> {
         .unwrap_or(false);
     let trace_window_secs = profile
         .and_then(|profile| profile.trace_window_secs)
-        .unwrap_or(10)
+        .unwrap_or(DEFAULT_TRACE_WINDOW_SECS)
         .max(1);
     let trace_latency_ms = profile
         .and_then(|profile| profile.trace_latency_ms)
@@ -368,7 +369,7 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
     let session_path = create_session_dir(cfg.session_keep)?;
     let (tx, rx) = mpsc::channel();
     let config_editor = ConfigEditor::new(ConfigDraft::from_resolved(&cfg));
-    let mut app = App {
+    let app = App {
         profile: cfg.profile,
         hosts: cfg.hosts,
         client_hosts: cfg.client_hosts,
@@ -425,13 +426,6 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
         session_path: Some(session_path),
         session_records: 0,
     };
-    app.log("cephlens live session started");
-    start_live_streams(&mut app);
-    spawn_trace_probe(&mut app);
-    if app.trace_auto_start {
-        let latency_ms = app.trace_latency_ms;
-        spawn_trace_run(&mut app, latency_ms);
-    }
     with_terminal(|terminal| run_app(terminal, app))
 }
 
@@ -456,7 +450,10 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         client_hosts: Vec::new(),
         refresh_secs: 1,
         trace_auto_start: false,
-        trace_window_secs: 10,
+        trace_window_secs: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.trace_window_secs)
+            .unwrap_or(DEFAULT_TRACE_WINDOW_SECS),
         trace_latency_ms: 1,
         trace_ttl_secs: DEFAULT_TRACE_TTL_SECS,
         session_keep: DEFAULT_SESSION_KEEP,
@@ -510,7 +507,7 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         radostrace_stop: Arc::new(AtomicBool::new(false)),
         radostrace_session: None,
         trace_auto_start: false,
-        trace_window_secs: 10,
+        trace_window_secs: fallback.trace_window_secs,
         trace_latency_ms: 1,
         trace_ttl_secs: DEFAULT_TRACE_TTL_SECS,
         trace_install: TraceInstallConfig::default(),
@@ -578,17 +575,36 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
 ) -> Result<Vec<CleanupResult>> {
+    let mut live_started = !matches!(app.mode, Mode::Live);
     loop {
         drain_worker_messages(&mut app);
 
-        if let Ok(size) = terminal.size() {
-            app.terminal_height = size.height;
+        let size = terminal.size()?;
+        app.terminal_height = size.height;
+        let size_supported = ui::terminal_size_supported(size.width, size.height);
+        if size_supported && !live_started {
+            start_live_app(&mut app);
+            live_started = true;
         }
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !size_supported {
+                        if key.code == KeyCode::Char('q')
+                            || key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL))
+                        {
+                            return if live_started {
+                                begin_shutdown(terminal, &mut app)
+                            } else {
+                                Ok(Vec::new())
+                            };
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -605,6 +621,16 @@ fn run_app(
                 _ => {}
             }
         }
+    }
+}
+
+fn start_live_app(app: &mut App) {
+    app.log("cephlens live session started");
+    start_live_streams(app);
+    spawn_trace_probe(app);
+    if app.trace_auto_start {
+        let latency_ms = app.trace_latency_ms;
+        spawn_trace_run(app, latency_ms);
     }
 }
 

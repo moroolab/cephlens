@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
@@ -14,7 +14,7 @@ use crate::app::{
 };
 use crate::diagnose::{DiagnoseInput, Insight, InsightLevel, diagnose, format_latency_us};
 use crate::editor::ConfigDraft;
-use crate::flow::{FlowRow, FlowSource, FlowTree, build_flow_tree, flow_totals};
+use crate::flow::{FlowPath, FlowSource, FlowTree, build_flow_tree, flow_paths, flow_totals};
 use crate::kfstrace::kfs_op_rows;
 use crate::radostrace::rados_pool_rows;
 use crate::trace::{TraceGraphRow, trace_graph_rows as build_trace_graph_rows};
@@ -28,9 +28,17 @@ const BAD: Color = Color::Rgb(255, 83, 112);
 const MUTED: Color = Color::Rgb(91, 99, 112);
 const TEXT: Color = Color::Rgb(198, 208, 219);
 
+pub(crate) const MIN_TERMINAL_WIDTH: u16 = 100;
+pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 32;
+const RECOMMENDED_TERMINAL_WIDTH: u16 = 142;
+
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
+    if !terminal_size_supported(area.width, area.height) {
+        draw_terminal_size_gate(frame, app, area);
+        return;
+    }
     let log_height = event_log_height_for(area, app.event_log_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -58,6 +66,61 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     if app.shutting_down {
         draw_shutdown(frame, app, area);
     }
+}
+
+pub(crate) fn terminal_size_supported(width: u16, height: u16) -> bool {
+    width >= MIN_TERMINAL_WIDTH && height >= MIN_TERMINAL_HEIGHT
+}
+
+fn draw_terminal_size_gate(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let activity = if app.trace_following
+        || app.trace_active > 0
+        || app.kfstrace_active > 0
+        || app.radostrace_active > 0
+    {
+        "Trace collection is still running."
+    } else if !app.stream_statuses.is_empty() {
+        "Live monitoring is still running."
+    } else if matches!(app.mode, Mode::Replay { .. }) {
+        "Resize to view this replay."
+    } else {
+        "Remote monitoring has not started."
+    };
+    let lines = vec![
+        Line::styled("Terminal too small", Style::default().fg(WARN).bold()),
+        Line::raw(""),
+        Line::styled(
+            format!(
+                "Current {}x{}  ·  Required {}x{}",
+                area.width, area.height, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT
+            ),
+            Style::default().fg(TEXT),
+        ),
+        Line::styled(
+            format!(
+                "Full dashboard recommended at {}x{}",
+                RECOMMENDED_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+        Line::styled(activity, Style::default().fg(TEXT)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Resize", Style::default().fg(ACCENT).bold()),
+            Span::raw(" to continue  ·  "),
+            Span::styled("q", Style::default().fg(WARN).bold()),
+            Span::raw(" quit"),
+        ]),
+    ];
+    let modal = centered_rect(72, 10, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(TEXT))
+            .block(panel(" cephlens ")),
+        modal,
+    );
 }
 
 fn event_log_height_for(area: Rect, preferred: u16) -> u16 {
@@ -573,16 +636,24 @@ fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn operator_insights(app: &App) -> Vec<Insight> {
     let trace_rows = trace_graph_rows(app, usize::MAX);
+    let trace_running =
+        app.trace_active > 0 || app.kfstrace_active > 0 || app.radostrace_active > 0;
+    let idle_message = if trace_running {
+        "trace is running with no matching events yet; workload may be idle or below the threshold"
+    } else {
+        "no trace data; press t/f/r to start osd/kfs/rados, a for all"
+    };
     diagnose(DiagnoseInput {
         snapshot: app.snapshot.as_ref(),
         admin_host: &app.admin_host,
         node_summaries: &app.node_summaries,
         stream_counts: Some(stream_counts(app)),
+        trace_window_secs: app.trace_window_secs,
         trace_events: &app.trace_events,
         trace_rows: &trace_rows,
         kfs_events: &app.kfstrace_events,
         rados_events: &app.radostrace_events,
-        idle_message: Some("no trace data; press t/f/r to start osd/kfs/rados, a for all"),
+        idle_message: Some(idle_message),
     })
 }
 
@@ -859,7 +930,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(15),
                 Constraint::Min(12),
             ],
-            Row::new(["OSD", "Ops", "Max", "PGs", "Top PG", "Max/2s"]),
+            Row::new(["OSD", "Ops", "Max", "PGs", "Busy PG", "Max/2s"]),
         )
     } else {
         (
@@ -876,7 +947,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Min(16),
             ],
             Row::new([
-                "OSD", "Host", "Ops", "Avg", "Max", "Queue", "Store", "PGs", "Top PG", "Max/2s",
+                "OSD", "Host", "Ops", "Avg", "Max", "Queue", "Store", "PGs", "Busy PG", "Max/2s",
             ]),
         )
     };
@@ -898,9 +969,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-/// Renders the OSD to PG to object tree. Terminal cells make curved edges
-/// unreadable, so the fan out is drawn with box characters and every branch is
-/// ordered by the active metric.
+/// Renders each observed OSD to PG to object mapping as a directional path.
 fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
     const MAX_OSDS: usize = 12;
     const MAX_CHILDREN: usize = 6;
@@ -914,27 +983,31 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
         MAX_OSDS,
         MAX_CHILDREN,
     );
+    let paths = flow_paths(&tree);
     let visible = table_visible_rows(area);
-    let total = tree.rows.len();
+    let total = paths.len();
     let scroll = clamp_top_scroll(app.flow_scroll, total, visible);
-    let compact = area.width < 88;
+    let compact = area.width < 120;
 
-    let rows = tree
-        .rows
+    let rows = paths
         .iter()
         .skip(scroll)
         .take(visible)
-        .map(|row| flow_table_row(row, compact));
+        .map(|path| flow_table_row(path, compact));
     let widths = if compact {
         vec![
-            Constraint::Min(20),
+            Constraint::Min(36),
             Constraint::Length(6),
+            Constraint::Length(9),
             Constraint::Length(9),
         ]
     } else {
         vec![
-            Constraint::Min(24),
-            Constraint::Length(11),
+            Constraint::Length(18),
+            Constraint::Length(3),
+            Constraint::Length(18),
+            Constraint::Length(3),
+            Constraint::Min(16),
             Constraint::Length(6),
             Constraint::Length(9),
             Constraint::Length(9),
@@ -942,11 +1015,14 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ]
     };
     let header = if compact {
-        Row::new(vec!["OSD / PG / Object", "Ops", "Max"])
+        Row::new(vec!["Observed path", "Ops", "Avg", "Max"])
     } else {
         Row::new(vec![
-            "OSD / PG / Object",
-            "Host / Acting",
+            "OSD / Host",
+            "",
+            "PG / Acting",
+            "",
+            "Object",
             "Ops",
             "Avg",
             "Max",
@@ -960,7 +1036,7 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .block(scroll_panel(
             app,
             PanelFocus::Trace,
-            &flow_panel_title(app, &tree),
+            &flow_panel_title(app, &tree, total),
             total,
             visible,
             scroll,
@@ -990,17 +1066,15 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-/// Names the level the tree reached and the active ordering, so the panel says
-/// why it has two levels instead of three.
-fn flow_panel_title(app: &App, tree: &FlowTree) -> String {
+fn flow_panel_title(app: &App, tree: &FlowTree, path_count: usize) -> String {
     let level = match tree.source {
-        FlowSource::Rados => "osd/pg/object",
-        FlowSource::Osd => "osd/pg",
+        FlowSource::Rados => "osd → pg → object",
+        FlowSource::Osd => "osd → pg",
         FlowSource::Empty => "idle",
     };
     let totals = flow_totals(&tree.rows);
     format!(
-        "flow {level} by {} {} ({} ops)",
+        "flow {level} · {} {} · {path_count} paths · {} ops",
         app.flow_metric.label(),
         app.flow_sort.label(),
         totals.ops
@@ -1015,43 +1089,69 @@ fn flow_empty_hint(app: &App) -> &'static str {
     }
 }
 
-/// Objects fan in to a PG and PGs fan in to an OSD, so the tree is drawn as a
-/// fan out from the OSD. Left to right that reads OSD, PG, object, which is the
-/// same chain the mapping follows.
-fn flow_table_row(row: &FlowRow, compact: bool) -> Row<'static> {
-    let (indent, color) = match row.depth {
-        0 => (String::new(), ACCENT),
-        1 => (
-            format!("  {} ", if row.last_child { "└─" } else { "├─" }),
-            BLUE,
-        ),
-        _ => (
-            format!("      {} ", if row.last_child { "└─" } else { "├─" }),
-            TEXT,
-        ),
-    };
-    let label = Cell::from(format!("{indent}{}", row.label)).style(if row.depth == 0 {
-        Style::default().fg(color).bold()
-    } else {
-        Style::default().fg(color)
-    });
-    let ops = Cell::from(row.stats.ops.to_string()).style(trace_ops_style(row.stats.ops));
-    let max = Cell::from(format_latency_us(row.stats.max_us))
-        .style(Style::default().fg(latency_color(row.stats.max_us)));
+fn flow_table_row(path: &FlowPath, compact: bool) -> Row<'static> {
+    let ops = Cell::from(path.stats.ops.to_string()).style(trace_ops_style(path.stats.ops));
+    let avg = Cell::from(format_latency_us(path.stats.avg_us()));
+    let max = Cell::from(format_latency_us(path.stats.max_us))
+        .style(Style::default().fg(latency_color(path.stats.max_us)));
 
     if compact {
-        Row::new(vec![label, ops, max])
+        let mut lane = vec![
+            Span::styled(path.osd.clone(), Style::default().fg(ACCENT).bold()),
+            Span::styled(" → ", Style::default().fg(MUTED)),
+            Span::styled(path.pg.clone(), Style::default().fg(BLUE)),
+        ];
+        if let Some(object) = &path.object {
+            lane.extend([
+                Span::styled(" → ", Style::default().fg(MUTED)),
+                Span::styled(short(object, 24), Style::default().fg(TEXT)),
+            ]);
+        }
+        Row::new(vec![Cell::from(Line::from(lane)), ops, avg, max])
     } else {
+        let (object_arrow, object) = match &path.object {
+            Some(object) => (
+                flow_arrow(),
+                Cell::from(short(object, 32)).style(Style::default().fg(TEXT)),
+            ),
+            None => (Cell::from(""), Cell::from("")),
+        };
         Row::new(vec![
-            label,
-            Cell::from(short(&row.detail, 11)).style(Style::default().fg(MUTED)),
+            flow_stage(&path.osd, &path.host, ACCENT, true),
+            flow_arrow(),
+            flow_stage(&path.pg, &path.acting, BLUE, false),
+            object_arrow,
+            object,
             ops,
-            Cell::from(format_latency_us(row.stats.avg_us())),
+            avg,
             max,
-            Cell::from(format_compact_bytes(row.stats.avg_bytes()))
+            Cell::from(format_compact_bytes(path.stats.avg_bytes()))
                 .style(Style::default().fg(MUTED)),
         ])
     }
+}
+
+fn flow_stage(label_text: &str, detail: &str, color: Color, bold: bool) -> Cell<'static> {
+    let label_style = if bold {
+        Style::default().fg(color).bold()
+    } else {
+        Style::default().fg(color)
+    };
+    Cell::from(Line::from(vec![
+        Span::styled(label_text.to_owned(), label_style),
+        Span::styled(
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", short(detail, 10))
+            },
+            Style::default().fg(MUTED),
+        ),
+    ]))
+}
+
+fn flow_arrow() -> Cell<'static> {
+    Cell::from("→").style(Style::default().fg(WARN).bold())
 }
 
 fn host_by_osd_id(app: &App) -> HashMap<i64, String> {
@@ -1083,6 +1183,7 @@ fn trace_graph_rows(app: &App, limit: usize) -> Vec<TraceGraphRow> {
         &app.trace_events,
         &app.trace_series,
         limit,
+        app.trace_window_secs,
     )
 }
 
@@ -1860,4 +1961,122 @@ fn format_compact_bytes(bytes: u64) -> String {
 
 fn format_kb(kb: u64) -> String {
     format_bytes(kb.saturating_mul(1024))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow::FlowStats;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn terminal_size_gate_requires_both_minimum_dimensions() {
+        assert!(terminal_size_supported(
+            MIN_TERMINAL_WIDTH,
+            MIN_TERMINAL_HEIGHT
+        ));
+        assert!(!terminal_size_supported(
+            MIN_TERMINAL_WIDTH - 1,
+            MIN_TERMINAL_HEIGHT
+        ));
+        assert!(!terminal_size_supported(
+            MIN_TERMINAL_WIDTH,
+            MIN_TERMINAL_HEIGHT - 1
+        ));
+    }
+
+    #[test]
+    fn flow_row_renders_a_directional_path_without_tree_glyphs() {
+        let path = FlowPath {
+            osd: "osd.4".to_owned(),
+            host: "node-b".to_owned(),
+            pg: "2.1f".to_owned(),
+            acting: "[4,2,3]".to_owned(),
+            object: Some("obj-a".to_owned()),
+            stats: FlowStats {
+                ops: 3,
+                sum_us: 1_500,
+                max_us: 900,
+                sum_bytes: 12_288,
+            },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Table::new(
+                        [flow_table_row(&path, false)],
+                        [
+                            Constraint::Length(18),
+                            Constraint::Length(3),
+                            Constraint::Length(18),
+                            Constraint::Length(3),
+                            Constraint::Min(16),
+                            Constraint::Length(6),
+                            Constraint::Length(9),
+                            Constraint::Length(9),
+                            Constraint::Length(9),
+                        ],
+                    ),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("osd.4 node-b"));
+        assert!(rendered.contains("2.1f [4,2,3]"));
+        assert!(rendered.contains("→"));
+        assert!(!rendered.contains('├'));
+        assert!(!rendered.contains('└'));
+    }
+
+    #[test]
+    fn pg_level_flow_path_stops_after_pg() {
+        let path = FlowPath {
+            osd: "osd.4".to_owned(),
+            host: "node-b".to_owned(),
+            pg: "2.1f".to_owned(),
+            acting: String::new(),
+            object: None,
+            stats: FlowStats::default(),
+        };
+        let backend = TestBackend::new(100, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let table = Table::new(
+                    [flow_table_row(&path, false)],
+                    [
+                        Constraint::Length(18),
+                        Constraint::Length(3),
+                        Constraint::Length(18),
+                        Constraint::Length(3),
+                        Constraint::Min(16),
+                        Constraint::Length(6),
+                        Constraint::Length(9),
+                        Constraint::Length(9),
+                        Constraint::Length(9),
+                    ],
+                );
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert_eq!(rendered.matches('→').count(), 1);
+    }
 }
