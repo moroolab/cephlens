@@ -1642,8 +1642,9 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let total = osds.len();
     let scroll = clamp_top_scroll(app.osds_scroll, total, visible);
     let rows = osds.iter().skip(scroll).take(visible).map(|osd| {
+        let (map_state, map_state_color) = osd_map_state(&osd.status, osd.reweight);
         let status_style = Style::default()
-            .fg(if osd.status == "up" { OK } else { BAD })
+            .fg(map_state_color)
             .add_modifier(Modifier::BOLD);
         let pg_bar = bar(
             osd.pgs as f64 / max_pgs as f64,
@@ -1654,7 +1655,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
                 Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
-                Cell::from(osd.status.clone()).style(status_style),
+                Cell::from(map_state).style(status_style),
                 Cell::from(osd.pgs.to_string()),
                 Cell::from(pg_bar).style(Style::default().fg(BLUE)),
             ])
@@ -1662,7 +1663,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
                 Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
-                Cell::from(osd.status.clone()).style(status_style),
+                Cell::from(map_state).style(status_style),
                 Cell::from(format!("{:.3}%", osd.utilization)),
                 Cell::from(osd.pgs.to_string()),
                 Cell::from(pg_bar).style(Style::default().fg(BLUE)),
@@ -1681,7 +1682,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
             vec![
                 Constraint::Length(7),
                 Constraint::Length(12),
-                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Length(5),
                 Constraint::Length(10),
             ],
@@ -1692,7 +1693,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
             vec![
                 Constraint::Length(7),
                 Constraint::Length(12),
-                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Length(9),
                 Constraint::Length(5),
                 Constraint::Length(16),
@@ -1724,6 +1725,21 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .row_highlight_style(Style::default().reversed());
 
     frame.render_widget(table, area);
+}
+
+fn osd_map_state(status: &str, reweight: f64) -> (String, Color) {
+    let is_up = status == "up";
+    let is_in = reweight > 0.0;
+    let color = match (is_up, is_in) {
+        (true, true) => OK,
+        (true, false) => WARN,
+        (false, true) => BAD,
+        (false, false) => BAD,
+    };
+    (
+        format!("{status}/{}", if is_in { "in" } else { "out" }),
+        color,
+    )
 }
 
 fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1994,6 +2010,15 @@ mod tests {
             MIN_TERMINAL_WIDTH,
             MIN_TERMINAL_HEIGHT - 1
         ));
+    }
+
+    #[test]
+    fn osd_map_state_combines_daemon_and_crush_membership() {
+        assert_eq!(osd_map_state("up", 1.0), ("up/in".to_owned(), OK));
+        assert_eq!(osd_map_state("up", 0.5), ("up/in".to_owned(), OK));
+        assert_eq!(osd_map_state("up", 0.0), ("up/out".to_owned(), WARN));
+        assert_eq!(osd_map_state("down", 1.0), ("down/in".to_owned(), BAD));
+        assert_eq!(osd_map_state("down", 0.0), ("down/out".to_owned(), BAD));
     }
 
     #[test]
