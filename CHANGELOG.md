@@ -12,6 +12,8 @@ Notable changes are documented here. The format follows
 
 - The OSD map state column now combines daemon state and CRUSH membership as
   `up/in`, `up/out`, `down/in`, or `down/out`.
+- The dashboard header shows the running version instead of repeating the
+  project name.
 
 ## [0.1.6] - 2026-07-26
 

@@ -294,7 +294,10 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "rd 0 0 B/s  wr 0 0 B/s".to_owned());
     let mut spans = vec![
-        Span::styled(" cephlens ", Style::default().fg(ACCENT).bold()),
+        Span::styled(
+            format!(" v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(ACCENT).bold(),
+        ),
         Span::styled(mode, Style::default().fg(BLUE).bold()),
         Span::raw("  "),
         pill(health, health_color(health)),
