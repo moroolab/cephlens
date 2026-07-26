@@ -22,11 +22,17 @@ use crate::{
 
 #[derive(Default)]
 struct TraceLogs {
+    osd_lines: usize,
     osd_events: Vec<TraceEvent>,
+    osd_errors: usize,
     osd_series: HashMap<String, VecDeque<TraceBucket>>,
     osd_now_bucket: Option<i64>,
+    kfs_lines: usize,
     kfs_events: Vec<KfsEvent>,
+    kfs_errors: usize,
+    rados_lines: usize,
     rados_events: Vec<RadosEvent>,
+    rados_errors: usize,
 }
 
 pub(crate) fn build_report(path: &Path) -> Result<String> {
@@ -37,7 +43,7 @@ pub(crate) fn build_report(path: &Path) -> Result<String> {
     let last = snapshots
         .last()
         .expect("load_snapshots returns at least one snapshot");
-    let logs = load_trace_logs(trace_log_dir(path).as_deref())?;
+    let logs = load_trace_logs(trace_log_dir(path).as_deref(), last.trace_window_secs)?;
     let node_summaries = node_summary_map(last);
     let now_bucket = logs
         .osd_now_bucket
@@ -48,12 +54,14 @@ pub(crate) fn build_report(path: &Path) -> Result<String> {
         &logs.osd_series,
         usize::MAX,
         now_bucket,
+        last.trace_window_secs,
     );
     let insights = diagnose(DiagnoseInput {
         snapshot: Some(last),
         admin_host: &last.admin_host,
         node_summaries: &node_summaries,
         stream_counts: None,
+        trace_window_secs: last.trace_window_secs,
         trace_events: &logs.osd_events,
         trace_rows: &osd_rows,
         kfs_events: &logs.kfs_events,
@@ -76,10 +84,15 @@ pub(crate) fn build_report(path: &Path) -> Result<String> {
     push_line(&mut out, &format!("Profile: `{}`", last.profile));
     push_line(&mut out, &format!("Admin host: `{}`", last.admin_host));
     push_line(&mut out, &format!("Hosts: {}", last.hosts.join(", ")));
+    push_line(
+        &mut out,
+        &format!("Trace window: {}s", last.trace_window_secs.max(1)),
+    );
     push_line(&mut out, "");
 
     push_cluster(&mut out, last);
     push_nodes(&mut out, &last.nodes);
+    push_trace_coverage(&mut out, &logs);
     push_insights(&mut out, &insights);
     push_osd_trace(&mut out, &osd_rows);
     push_kfs_trace(&mut out, &logs.kfs_events);
@@ -88,15 +101,19 @@ pub(crate) fn build_report(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-fn load_trace_logs(dir: Option<&Path>) -> Result<TraceLogs> {
+fn load_trace_logs(dir: Option<&Path>, trace_window_secs: u64) -> Result<TraceLogs> {
     let Some(dir) = dir else {
         return Ok(TraceLogs::default());
     };
     let mut logs = TraceLogs::default();
     load_trace_payloads(&dir.join(TRACE_OSD_LOG), |stamp, host, payload| {
+        logs.osd_lines += 1;
         if let Some(event) = parse_trace_event(host, payload) {
+            if event.op == "error" {
+                logs.osd_errors += 1;
+            }
             if let Some(bucket) = trace_bucket(stamp) {
-                record_trace_event_at(&mut logs.osd_series, &event, bucket);
+                record_trace_event_at(&mut logs.osd_series, &event, bucket, trace_window_secs);
                 logs.osd_now_bucket =
                     Some(logs.osd_now_bucket.map_or(bucket, |last| last.max(bucket)));
             }
@@ -104,11 +121,19 @@ fn load_trace_logs(dir: Option<&Path>) -> Result<TraceLogs> {
         }
     })?;
     load_trace_payloads(&dir.join(TRACE_KFS_LOG), |_, _, payload| {
+        logs.kfs_lines += 1;
+        if payload.starts_with("__CEPHLENS_KFS_ERROR__") {
+            logs.kfs_errors += 1;
+        }
         if let Some(event) = parse_kfs_event(payload) {
             logs.kfs_events.push(event);
         }
     })?;
     load_trace_payloads(&dir.join(TRACE_RADOS_LOG), |_, _, payload| {
+        logs.rados_lines += 1;
+        if payload.starts_with("__CEPHLENS_RADOS_ERROR__") {
+            logs.rados_errors += 1;
+        }
         if let Some(event) = parse_rados_event(payload) {
             logs.rados_events.push(event);
         }
@@ -216,6 +241,35 @@ fn push_nodes(out: &mut String, nodes: &[NodeSummary]) {
     push_line(out, "");
 }
 
+fn push_trace_coverage(out: &mut String, logs: &TraceLogs) {
+    push_line(out, "## trace coverage");
+    push_line(out, "");
+    push_line(
+        out,
+        &format!(
+            "- Raw lines: osd `{}`, kfs `{}`, rados `{}`",
+            logs.osd_lines, logs.kfs_lines, logs.rados_lines
+        ),
+    );
+    push_line(
+        out,
+        &format!(
+            "- Parsed events: osd `{}`, kfs `{}`, rados `{}`",
+            logs.osd_events.len(),
+            logs.kfs_events.len(),
+            logs.rados_events.len()
+        ),
+    );
+    push_line(
+        out,
+        &format!(
+            "- Trace errors: osd `{}`, kfs `{}`, rados `{}`",
+            logs.osd_errors, logs.kfs_errors, logs.rados_errors
+        ),
+    );
+    push_line(out, "");
+}
+
 fn push_insights(out: &mut String, insights: &[crate::diagnose::Insight]) {
     push_line(out, "## insights");
     push_line(out, "");
@@ -246,7 +300,7 @@ fn push_osd_trace(out: &mut String, rows: &[crate::trace::TraceGraphRow]) {
     }
     push_line(
         out,
-        "| OSD | Host | Ops | Avg | Max | Queue | Store | KV commit | Hot PG |",
+        "| OSD | Host | Ops | Avg | Max | Queue | Store | KV commit | Busy PG |",
     );
     push_line(
         out,
@@ -372,6 +426,7 @@ mod tests {
             profile: "test".to_owned(),
             admin_host: "admin".to_owned(),
             hosts: vec!["node-a".to_owned()],
+            trace_window_secs: 10,
             cluster: ClusterSummary {
                 health: "HEALTH_OK".to_owned(),
                 osds_total: 1,
@@ -413,7 +468,9 @@ mod tests {
 
         let report = build_report(&dir).unwrap();
 
-        assert!(report.contains("dominant queue 20.0ms"));
+        assert!(report.contains("Trace window: 10s"));
+        assert!(report.contains("largest observed component queue 20.0ms"));
+        assert!(report.contains("- Parsed events: osd `1`, kfs `0`, rados `0`"));
         assert!(report.contains(
             "| node-a | node-a | ok | - | 90.0% | 0.0% | generic | ceph version test | - |"
         ));

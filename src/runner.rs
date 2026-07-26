@@ -250,7 +250,7 @@ cleanup() {
 }
 
 trap cleanup INT TERM HUP EXIT
-echo "__CEPHLENS_RUNNER__ starting ttl=${ttl_secs}s latency_ms=${latency_ms}"
+echo "__CEPHLENS_RUNNER__ starting ttl=${ttl_secs}s latency_ms=${latency_ms}" >&2
 
 if ! sudo -n true 2>/dev/null; then
   echo "__CEPHLENS_TRACE_ERROR__ sudo -n unavailable"
@@ -268,24 +268,24 @@ fi
 
 (
   sleep "$ttl_secs"
-  echo "__CEPHLENS_RUNNER__ ttl expired"
+  echo "__CEPHLENS_RUNNER__ ttl expired" >&2
   kill -TERM $$
 ) &
 ttl_pid=$!
 
 sudo -n "$bin" -a -l "$latency_ms" 2>&1 &
 trace_pid=$!
-echo "__CEPHLENS_RUNNER__ osdtrace_pid=$trace_pid"
+echo "__CEPHLENS_RUNNER__ osdtrace_pid=$trace_pid" >&2
 wait "$trace_pid"
 status=$?
 trace_pid=""
 case "$status" in
   130|143)
-    echo "__CEPHLENS_RUNNER__ osdtrace stopped"
+    echo "__CEPHLENS_RUNNER__ osdtrace stopped" >&2
     exit 0
     ;;
 esac
-echo "__CEPHLENS_RUNNER__ osdtrace exited status=$status"
+echo "__CEPHLENS_RUNNER__ osdtrace exited status=$status" >&2
 exit "$status"
 "#
 }
@@ -307,5 +307,13 @@ mod tests {
 
         assert!(script.contains("130|143) code=0"));
         assert!(script.contains("__CEPHLENS_RUNNER__ osdtrace stopped"));
+    }
+
+    #[test]
+    fn trace_runner_keeps_status_off_trace_stdout() {
+        let script = trace_runner_script();
+
+        assert!(script.contains("echo \"__CEPHLENS_RUNNER__ ttl expired\" >&2"));
+        assert!(script.contains("echo \"__CEPHLENS_RUNNER__ osdtrace_pid=$trace_pid\" >&2"));
     }
 }

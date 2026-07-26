@@ -41,6 +41,7 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
         profile: cfg.profile.clone(),
         admin_host: cfg.admin_host.clone(),
         hosts: cfg.hosts.clone(),
+        trace_window_secs: cfg.trace_window_secs,
         cluster,
         nodes,
         osds,

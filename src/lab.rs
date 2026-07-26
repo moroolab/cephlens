@@ -16,7 +16,7 @@ use crate::{
         TRACE_KFS_LOG, TRACE_OSD_LOG, TRACE_RADOS_LOG, append_snapshot, append_trace_line,
         create_session_dir, session_snapshot_path,
     },
-    ssh::ssh_output,
+    ssh::ssh_stream_lines,
     trace::{kfstrace_run_command, radostrace_run_command},
 };
 
@@ -119,11 +119,13 @@ fn spawn_trace_capture(
     stdin: Option<String>,
     error_prefix: &'static str,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(
-        move || match ssh_output(&host, &command, stdin.as_deref()) {
+    thread::spawn(move || {
+        match ssh_stream_lines(&host, &command, stdin.as_deref(), |line| {
+            if !line.trim().is_empty() {
+                let _ = append_trace_line(&session_dir, file_name, &host, line);
+            }
+        }) {
             Ok(output) => {
-                append_output_lines(&session_dir, file_name, &host, &output.stdout);
-                append_output_lines(&session_dir, file_name, &host, &output.stderr);
                 if !output.success {
                     append_trace_error(
                         &session_dir,
@@ -141,14 +143,8 @@ fn spawn_trace_capture(
                 error_prefix,
                 &format!("{err:#}"),
             ),
-        },
-    )
-}
-
-fn append_output_lines(session_dir: &Path, file_name: &str, host: &str, output: &str) {
-    for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = append_trace_line(session_dir, file_name, host, line);
-    }
+        }
+    })
 }
 
 fn append_trace_error(

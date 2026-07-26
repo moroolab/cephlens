@@ -55,11 +55,10 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 - Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
   numbers, and health check names read straight out of `ceph -s`.
 - osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
-- A flow view of the OSD, placement group, and object behind the observed
-  ops, built from the trace lines already streaming. radostrace names the
-  object so the view has three levels; with only osdtrace it collapses to
-  OSD and placement group. Rows carry the mean op size next to the latency; a
-  read reports the length it requested, not the bytes returned.
+- A flow view that renders each observed op as an OSD -> placement group ->
+  object path. radostrace supplies the complete path; with only osdtrace, the
+  path stops at the placement group. Each row carries op count, latency, and
+  mean op size; a read reports the length it requested, not the bytes returned.
 - No standing agent: no permanent daemon on the nodes; the osdtrace runner script removes itself on stop, quit, or TTL expiry. (The cephtrace tracer binaries you deploy do persist under `~/.cephlens/bin/`.)
 - Edit hosts and trace settings live in the TUI; changes apply to open SSH streams immediately.
 - Export recorded sessions as Markdown reports with the same diagnostic rules used by the TUI.
@@ -291,7 +290,7 @@ p          run a probe readiness check
 c          edit config
 t/f/r      view osdtrace / kfstrace / radostrace; press again to start or stop (confirmed)
 a          start or stop all trace sources (confirmed)
-m          flow view: the osd -> pg -> object mapping behind the live ops
+m          flow view: one osd -> pg -> object path per observed live op
 o          flow view: order by op count or by latency
 s          flow view: reverse the order
 i          install osdtrace
@@ -322,6 +321,11 @@ Config edits are written to `cephlens.toml` and applied to the live SSH streams
 immediately after the edit is confirmed.
 
 The integrated trace panel can show osdtrace, kfstrace, or radostrace data. The osdtrace view observes Ceph OSD nodes. It streams `op_r`, `op_w`, and `subop_w` lines into the live dashboard and summarizes total, queue, and BlueStore latency. The kfstrace and radostrace views run on `client_hosts`. The kfstrace view uses MDS mode and shows CephFS metadata operations.
+`trace_window_secs` controls the recent osdtrace aggregation window in both the
+live TUI and generated reports.
+The TUI requires a terminal of at least 100 columns by 32 rows. A 142 by 32
+terminal is recommended for the full dashboard. Live SSH streams and automatic
+tracing do not start until the terminal reaches the minimum size.
 On wide terminals the trace panel appears on the right; on tall terminals it
 appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
@@ -382,6 +386,10 @@ Turn a recorded session into a Markdown investigation note:
 ```sh
 cargo run -- report .cephlens/sessions/<timestamp> --out report.md
 ```
+
+Reports include raw-line, parsed-event, and trace-error counts for each trace
+source so an empty result can be distinguished from a capture that observed no
+matching operations.
 
 Replay a recorded snapshot sequence in the TUI:
 

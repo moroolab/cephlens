@@ -27,6 +27,7 @@ pub(crate) struct DiagnoseInput<'a> {
     pub(crate) admin_host: &'a str,
     pub(crate) node_summaries: &'a HashMap<String, NodeSummary>,
     pub(crate) stream_counts: Option<(usize, usize)>,
+    pub(crate) trace_window_secs: u64,
     pub(crate) trace_events: &'a [TraceEvent],
     pub(crate) trace_rows: &'a [TraceGraphRow],
     pub(crate) kfs_events: &'a [KfsEvent],
@@ -106,7 +107,11 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
         .filter(|row| row.ops > 0)
         .collect::<Vec<_>>();
     if !active_rows.is_empty() {
-        insights.extend(osd_trace_insights(input.node_summaries, &active_rows));
+        insights.extend(osd_trace_insights(
+            input.node_summaries,
+            &active_rows,
+            input.trace_window_secs,
+        ));
     }
     insights.extend(node_pressure_insights(input.node_summaries));
     insights.extend(kfs_insights(input.kfs_events));
@@ -176,6 +181,7 @@ fn node_pressure_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<
 fn osd_trace_insights(
     node_summaries: &HashMap<String, NodeSummary>,
     active_rows: &[&TraceGraphRow],
+    trace_window_secs: u64,
 ) -> Vec<Insight> {
     let mut insights = Vec::new();
     let total_ops = active_rows.iter().map(|row| row.ops).sum::<u64>();
@@ -192,7 +198,8 @@ fn osd_trace_insights(
     insights.push(Insight {
         level: worst_level,
         text: format!(
-            "last 60s: {total_ops} ops on {} OSDs; worst {} max {} avg {}",
+            "last {}s: {total_ops} ops on {} OSDs; worst {} max {} avg {}",
+            trace_window_secs.max(1),
             active_rows.len(),
             worst.osd,
             format_latency_us(worst.max_us),
@@ -205,7 +212,7 @@ fn osd_trace_insights(
         insights.push(Insight {
             level: insight_level_for_latency(dominant.value_us),
             text: format!(
-                "dominant {} {}; suspect {}",
+                "largest observed component {} {}; possible area {}; maxima may be from different ops",
                 dominant.name,
                 format_latency_us(dominant.value_us),
                 dominant.suspect
@@ -223,7 +230,7 @@ fn osd_trace_insights(
         insights.push(Insight {
             level: InsightLevel::Info,
             text: format!(
-                "top PG on {}: {}; compare acting set if it stays hot",
+                "busiest PG on {}: {}; compare acting set if it stays busy",
                 worst.osd, worst.hot_pg
             ),
         });
@@ -333,21 +340,12 @@ fn cross_source_insight(
     }
     let client = format_latency_us(client_max);
     let server = format_latency_us(server_max);
-    if client_max > server_max.saturating_mul(2) {
-        Some(Insight {
-            level: InsightLevel::Warn,
-            text: format!(
-                "cross: rados client {client} vs osd server {server}; gap = network/messenger/queue"
-            ),
-        })
-    } else {
-        Some(Insight {
-            level: InsightLevel::Info,
-            text: format!(
-                "cross: rados client {client} vs osd server {server}; client tracks server"
-            ),
-        })
-    }
+    Some(Insight {
+        level: InsightLevel::Info,
+        text: format!(
+            "cross-source maxima (not time/PG correlated): rados client {client}, osd server {server}; verify raw traces before attribution"
+        ),
+    })
 }
 
 pub(crate) fn insight_level_for_latency(latency_us: u64) -> InsightLevel {
@@ -390,6 +388,7 @@ fn node_for_host<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::radostrace::parse_rados_event;
 
     fn row(osd: &str, host: &str, max_us: u64, queue_us: u64) -> TraceGraphRow {
         TraceGraphRow {
@@ -428,6 +427,7 @@ mod tests {
             admin_host: "admin",
             node_summaries: &nodes,
             stream_counts: None,
+            trace_window_secs: 10,
             trace_events: &[],
             trace_rows: &rows,
             kfs_events: &[],
@@ -435,15 +435,35 @@ mod tests {
             idle_message: None,
         });
 
+        assert!(insights.iter().any(|insight| {
+            insight
+                .text
+                .contains("largest observed component queue 20.0ms")
+        }));
         assert!(
             insights
                 .iter()
-                .any(|insight| insight.text.contains("dominant queue 20.0ms"))
+                .any(|insight| insight.text.contains("last 10s"))
         );
         assert!(
             insights
                 .iter()
                 .any(|insight| insight.text.contains("node-a CPU 90.0%"))
         );
+    }
+
+    #[test]
+    fn cross_source_maxima_are_not_presented_as_attribution() {
+        let rows = [row("osd.1", "node-a", 10_000, 0)];
+        let rados = vec![
+            parse_rados_event("1 1 1 1 01 [1,2,3] W 4096 30000 obj [write][0,4096]")
+                .expect("fixture parses"),
+        ];
+
+        let insight = cross_source_insight(&[&rows[0]], &rados).unwrap();
+
+        assert_eq!(insight.level, InsightLevel::Info);
+        assert!(insight.text.contains("not time/PG correlated"));
+        assert!(!insight.text.contains("gap ="));
     }
 }

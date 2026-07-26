@@ -616,6 +616,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
             profile: app.profile.clone(),
             admin_host: app.admin_host.clone(),
             hosts: app.hosts.clone(),
+            trace_window_secs: app.trace_window_secs,
             cluster: parse_cluster_summary(status),
             nodes: ordered_nodes(app),
             osds: parse_osds(tree, df, perf),
@@ -1274,5 +1275,6 @@ fn spawn_trace_runner(
 
 fn record_trace_event(app: &mut App, event: &TraceEvent) {
     let now_bucket = Utc::now().timestamp() / TRACE_BUCKET_SECS;
-    record_trace_event_at(&mut app.trace_series, event, now_bucket);
+    let retention_secs = app.trace_ttl_secs.max(app.trace_window_secs);
+    record_trace_event_at(&mut app.trace_series, event, now_bucket, retention_secs);
 }

@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -14,6 +15,8 @@ pub(crate) const TRACE_OSD_LOG: &str = "trace-osd.log";
 pub(crate) const TRACE_KFS_LOG: &str = "trace-kfs.log";
 pub(crate) const TRACE_RADOS_LOG: &str = "trace-rados.log";
 pub(crate) const DEFAULT_SESSION_KEEP: usize = 20;
+
+static TRACE_LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn append_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -29,6 +32,9 @@ pub(crate) fn append_trace_line(
     line: &str,
 ) -> Result<()> {
     let path = session_dir.join(file_name);
+    let _guard = TRACE_LOG_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("trace log write lock is poisoned"))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -129,7 +135,10 @@ fn is_session_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ClusterSummary, Snapshot};
+    use crate::model::{
+        ClusterSummary, DEFAULT_TRACE_WINDOW_SECS, LEGACY_TRACE_WINDOW_SECS, Snapshot,
+    };
+    use std::sync::{Arc, Barrier};
 
     fn temp_session_dir() -> PathBuf {
         let id = Utc::now()
@@ -144,6 +153,7 @@ mod tests {
             profile: "test".to_owned(),
             admin_host: "admin".to_owned(),
             hosts: vec!["node-a".to_owned()],
+            trace_window_secs: DEFAULT_TRACE_WINDOW_SECS,
             cluster: ClusterSummary::default(),
             nodes: Vec::new(),
             osds: Vec::new(),
@@ -163,6 +173,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_trace_writes_keep_records_intact() {
+        let dir = temp_session_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|worker| {
+                let dir = dir.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for event in 0..500 {
+                        append_trace_line(
+                            &dir,
+                            TRACE_OSD_LOG,
+                            &format!("node-{worker}"),
+                            &format!("event-{worker}-{event}"),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let raw = fs::read_to_string(dir.join(TRACE_OSD_LOG)).unwrap();
+        let lines = raw.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4_000);
+        for line in lines {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3, "corrupt record: {line}");
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(fields[0]).is_ok(),
+                "invalid timestamp: {line}"
+            );
+            assert!(fields[1].starts_with("node-"), "invalid host: {line}");
+            assert!(fields[2].starts_with("event-"), "invalid payload: {line}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn load_snapshots_accepts_session_directory() {
         let dir = temp_session_dir();
         fs::create_dir_all(&dir).unwrap();
@@ -173,6 +227,16 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].profile, "test");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_trace_window() {
+        let mut value = serde_json::to_value(snapshot()).unwrap();
+        value.as_object_mut().unwrap().remove("trace_window_secs");
+
+        let snapshot: Snapshot = serde_json::from_value(value).unwrap();
+
+        assert_eq!(snapshot.trace_window_secs, LEGACY_TRACE_WINDOW_SECS);
     }
 
     #[test]

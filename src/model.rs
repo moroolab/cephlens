@@ -1,15 +1,24 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DEFAULT_TRACE_WINDOW_SECS: u64 = 10;
+pub(crate) const LEGACY_TRACE_WINDOW_SECS: u64 = 60;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub(crate) captured_at: DateTime<Utc>,
     pub(crate) profile: String,
     pub(crate) admin_host: String,
     pub(crate) hosts: Vec<String>,
+    #[serde(default = "legacy_trace_window_secs")]
+    pub(crate) trace_window_secs: u64,
     pub(crate) cluster: ClusterSummary,
     pub(crate) nodes: Vec<NodeSummary>,
     pub(crate) osds: Vec<OsdSummary>,
+}
+
+fn legacy_trace_window_secs() -> u64 {
+    LEGACY_TRACE_WINDOW_SECS
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -6,6 +6,26 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-26
+
+### Added
+
+- Added per-source trace coverage counts to session reports.
+
+### Fixed
+
+- Applied `trace_window_secs` to live and report osdtrace aggregation.
+- Reworded aggregate component and cross-source insights so uncorrelated maxima
+  are not presented as causal attribution.
+- Added a 100x32 terminal-size gate so remote monitoring and automatic tracing
+  do not start behind an incomplete dashboard.
+
+### Changed
+
+- Replaced the indented flow hierarchy with one directional OSD -> PG -> object
+  path per row. PG-level osdtrace paths now stop at the PG instead of implying
+  that object data is available.
+
 ## [0.1.5] - 2026-07-25
 
 ### Added
@@ -107,7 +127,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/xtrusia/cephlens/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/xtrusia/cephlens/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/xtrusia/cephlens/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/xtrusia/cephlens/compare/v0.1.2...v0.1.3

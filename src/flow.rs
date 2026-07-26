@@ -1,4 +1,4 @@
-//! Builds the OSD to PG to object tree the flow panel renders.
+//! Builds the OSD to PG to object aggregation behind the flow panel.
 //!
 //! Both trace sources already carry the mapping. radostrace lines name the
 //! object, its placement group, and the acting set, which gives all three
@@ -125,6 +125,60 @@ pub(crate) struct FlowRow {
 pub(crate) struct FlowTree {
     pub(crate) source: FlowSource,
     pub(crate) rows: Vec<FlowRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowPath {
+    pub(crate) osd: String,
+    pub(crate) host: String,
+    pub(crate) pg: String,
+    pub(crate) acting: String,
+    pub(crate) object: Option<String>,
+    pub(crate) stats: FlowStats,
+}
+
+pub(crate) fn flow_paths(tree: &FlowTree) -> Vec<FlowPath> {
+    let mut paths = Vec::new();
+    let mut osd: Option<(String, String)> = None;
+    let mut pg: Option<(String, String)> = None;
+
+    for row in &tree.rows {
+        match row.depth {
+            0 => {
+                osd = Some((row.label.clone(), row.detail.clone()));
+                pg = None;
+            }
+            1 => {
+                pg = Some((row.label.clone(), row.detail.clone()));
+                if tree.source == FlowSource::Osd
+                    && let Some((osd, host)) = &osd
+                {
+                    paths.push(FlowPath {
+                        osd: osd.clone(),
+                        host: host.clone(),
+                        pg: row.label.clone(),
+                        acting: row.detail.clone(),
+                        object: None,
+                        stats: row.stats.clone(),
+                    });
+                }
+            }
+            _ => {
+                if let (Some((osd, host)), Some((pg, acting))) = (&osd, &pg) {
+                    paths.push(FlowPath {
+                        osd: osd.clone(),
+                        host: host.clone(),
+                        pg: pg.clone(),
+                        acting: acting.clone(),
+                        object: Some(row.label.clone()),
+                        stats: row.stats.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    paths
 }
 
 #[derive(Default)]
@@ -359,6 +413,33 @@ mod tests {
         assert_eq!(tree.rows[0].stats.ops, 2);
         assert_eq!(tree.rows[0].stats.max_us, 900);
         assert_eq!(tree.rows[0].stats.avg_us(), 500);
+    }
+
+    #[test]
+    fn flow_paths_render_complete_directional_lanes() {
+        let events = vec![
+            rados("1 1 1 2 1f [4,2,3] W 4096 900 obj-a [write][0,4096]"),
+            rados("1 1 2 2 1f [4,2,3] W 4096 100 obj-b [write][0,4096]"),
+        ];
+        let tree = build_flow_tree(
+            &events,
+            &[],
+            &hosts(),
+            FlowMetric::Latency,
+            FlowSort::Descending,
+            8,
+            8,
+        );
+
+        let paths = flow_paths(&tree);
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].osd, "osd.4");
+        assert_eq!(paths[0].host, "node-b");
+        assert_eq!(paths[0].pg, "2.1f");
+        assert_eq!(paths[0].acting, "[4,2,3]");
+        assert_eq!(paths[0].object.as_deref(), Some("obj-a"));
+        assert_eq!(paths[0].stats.max_us, 900);
     }
 
     #[test]

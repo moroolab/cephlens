@@ -7,7 +7,6 @@ use crate::model::Snapshot;
 use crate::util::shell_quote;
 
 pub(crate) const TRACE_BUCKET_SECS: i64 = 2;
-pub(crate) const TRACE_BUCKET_COUNT: usize = 30;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TraceTarget {
@@ -596,9 +595,17 @@ pub(crate) fn trace_graph_rows(
     trace_events: &[TraceEvent],
     trace_series: &HashMap<String, VecDeque<TraceBucket>>,
     limit: usize,
+    window_secs: u64,
 ) -> Vec<TraceGraphRow> {
     let now_bucket = Utc::now().timestamp() / TRACE_BUCKET_SECS;
-    trace_graph_rows_at(snapshot, trace_events, trace_series, limit, now_bucket)
+    trace_graph_rows_at(
+        snapshot,
+        trace_events,
+        trace_series,
+        limit,
+        now_bucket,
+        window_secs,
+    )
 }
 
 pub(crate) fn trace_graph_rows_at(
@@ -607,6 +614,7 @@ pub(crate) fn trace_graph_rows_at(
     trace_series: &HashMap<String, VecDeque<TraceBucket>>,
     limit: usize,
     now_bucket: i64,
+    window_secs: u64,
 ) -> Vec<TraceGraphRow> {
     let mut hosts = BTreeMap::new();
     if let Some(snapshot) = snapshot {
@@ -624,7 +632,7 @@ pub(crate) fn trace_graph_rows_at(
         hosts.entry(osd.clone()).or_insert_with(|| "-".to_owned());
     }
 
-    let first_bucket = now_bucket - TRACE_BUCKET_COUNT as i64 + 1;
+    let first_bucket = now_bucket - trace_bucket_count(window_secs) as i64 + 1;
     let mut rows = hosts
         .into_iter()
         .map(|(osd, host)| {
@@ -703,6 +711,7 @@ pub(crate) fn record_trace_event_at(
     trace_series: &mut HashMap<String, VecDeque<TraceBucket>>,
     event: &TraceEvent,
     bucket_id: i64,
+    retention_secs: u64,
 ) {
     let osd = normalize_osd_name(&event.osd);
     if osd == "-" || event.op == "error" {
@@ -720,7 +729,7 @@ pub(crate) fn record_trace_event_at(
             ..TraceBucket::default()
         });
     }
-    while series.len() > TRACE_BUCKET_COUNT {
+    while series.len() > trace_bucket_count(retention_secs) {
         series.pop_front();
     }
 
@@ -742,6 +751,10 @@ pub(crate) fn record_trace_event_at(
             pg_stats.op_max_us = pg_stats.op_max_us.max(event.op_lat_us);
         }
     }
+}
+
+fn trace_bucket_count(window_secs: u64) -> usize {
+    window_secs.max(1).div_ceil(TRACE_BUCKET_SECS as u64) as usize
 }
 
 fn hot_pg_label(pg_stats: HashMap<String, TracePgStats>) -> String {
@@ -988,7 +1001,7 @@ mod tests {
         series_by_osd.insert("osd.2".to_owned(), osd2);
         series_by_osd.insert("osd.3".to_owned(), osd3);
 
-        let rows = trace_graph_rows(None, &[], &series_by_osd, usize::MAX);
+        let rows = trace_graph_rows(None, &[], &series_by_osd, usize::MAX, 60);
 
         assert_eq!(rows[0].osd, "osd.2");
         assert_eq!(rows[0].ops, 5);
@@ -1009,6 +1022,21 @@ mod tests {
             series_by_osd.insert(format!("osd.{id}"), series);
         }
 
-        assert_eq!(trace_graph_rows(None, &[], &series_by_osd, 2).len(), 2);
+        assert_eq!(trace_graph_rows(None, &[], &series_by_osd, 2, 60).len(), 2);
+    }
+
+    #[test]
+    fn trace_graph_rows_respects_configured_window() {
+        let now_bucket = Utc::now().timestamp() / TRACE_BUCKET_SECS;
+        let mut series = VecDeque::new();
+        series.push_back(bucket_with_pg(now_bucket - 10, 4, 40_000, "1.a"));
+        series.push_back(bucket_with_pg(now_bucket, 1, 1_000, "1.b"));
+        let series_by_osd = HashMap::from([("osd.1".to_owned(), series)]);
+
+        let rows = trace_graph_rows_at(None, &[], &series_by_osd, usize::MAX, now_bucket, 10);
+
+        assert_eq!(rows[0].ops, 1);
+        assert_eq!(rows[0].max_us, 1_000);
+        assert_eq!(rows[0].hot_pg, "1.b:1");
     }
 }
