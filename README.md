@@ -334,9 +334,13 @@ appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
 host for node readiness. `refresh_secs` is the pause between ticks, so the
 period an operator sees is that pause plus the time the remote queries take. On
-a four node microceph cluster the cluster stream ticks about every 1.4s at the
-default `refresh_secs = 1`. The node table shows connection state (`live`,
-`dial`, `retry`, `error`), OSD ids, CPU percentage, and memory percentage.
+each cluster tick, `ceph -s` refreshes while one of `ceph osd tree`, `ceph osd
+df`, and `ceph osd perf` rotates in. Static node facts are collected when the
+stream connects, OSD processes are scanned no more often than every five
+seconds, and CPU, memory, and pressure values follow `refresh_secs`. The node
+table shows connection state (`live`, `dial`, `retry`, `error`), OSD ids, CPU
+percentage, and memory percentage. The TUI redraws after input or new stream
+data instead of on every event poll.
 When `trace_auto_start` is true, cephlens starts osdtrace runners as soon as the
 TUI opens. The default config keeps it false so an operator explicitly starts
 and stops tracing with `t`, `f`, `r`, or `a`.

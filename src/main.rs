@@ -576,8 +576,9 @@ fn run_app(
     mut app: App,
 ) -> Result<Vec<CleanupResult>> {
     let mut live_started = !matches!(app.mode, Mode::Live);
+    let mut needs_redraw = true;
     loop {
-        drain_worker_messages(&mut app);
+        needs_redraw |= drain_worker_messages(&mut app);
 
         let size = terminal.size()?;
         app.terminal_height = size.height;
@@ -585,8 +586,12 @@ fn run_app(
         if size_supported && !live_started {
             start_live_app(&mut app);
             live_started = true;
+            needs_redraw = true;
         }
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        if needs_redraw {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            needs_redraw = false;
+        }
 
         if event::poll(Duration::from_millis(150))? {
             match event::read()? {
@@ -614,9 +619,11 @@ fn run_app(
                     if handle_key(&mut app, key)? {
                         return begin_shutdown(terminal, &mut app);
                     }
+                    needs_redraw = true;
                 }
                 Event::Resize(_, _) => {
                     terminal.clear()?;
+                    needs_redraw = true;
                 }
                 _ => {}
             }

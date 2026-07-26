@@ -6,6 +6,16 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-26
+
+### Changed
+
+- The live TUI redraws only after input or state changes instead of repainting
+  the full screen every 150ms.
+- The cluster stream keeps `ceph -s` on every tick and rotates `ceph osd tree`,
+  `ceph osd df`, and `ceph osd perf` across ticks. Node streams cache static
+  host facts and scan OSD processes no more often than every five seconds.
+
 ## [0.1.8] - 2026-07-26
 
 ### Fixed
@@ -145,7 +155,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/xtrusia/cephlens/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xtrusia/cephlens/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xtrusia/cephlens/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/xtrusia/cephlens/compare/v0.1.5...v0.1.6

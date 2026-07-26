@@ -472,8 +472,10 @@ fn log_trace_targets(app: &mut App, verb: &str, targets: &[TraceTarget]) {
     }
 }
 
-pub(crate) fn drain_worker_messages(app: &mut App) {
+pub(crate) fn drain_worker_messages(app: &mut App) -> bool {
+    let mut changed = false;
     while let Ok(msg) = app.rx.try_recv() {
+        changed = true;
         match msg {
             WorkerMsg::Probe(output) => {
                 for line in output.lines() {
@@ -560,6 +562,7 @@ pub(crate) fn drain_worker_messages(app: &mut App) {
             }
         }
     }
+    changed
 }
 
 fn handle_stream_msg(app: &mut App, msg: StreamMsg) {

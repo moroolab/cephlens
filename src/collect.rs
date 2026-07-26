@@ -8,7 +8,7 @@ use crate::{
     config::ResolvedConfig,
     model::{ClusterSummary, HealthCheck, NodeSummary, OsdSummary, Snapshot},
     ssh::ssh_capture,
-    stream::NODE_FACTS_SNIPPET,
+    stream::node_facts_snippet,
     util::{MAX_PARALLEL_HOSTS, map_parallel, ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
 };
 
@@ -194,6 +194,7 @@ pub(crate) fn parse_osds(tree: &Value, df: &Value, perf: Option<&Value>) -> Vec<
 }
 
 fn collect_node(host: &str) -> NodeSummary {
+    let facts = node_facts_snippet();
     let command = format!(
         r#"
 {facts}
@@ -220,7 +221,7 @@ printf 'mem_percent=%s\n' "$mem_pct"
 printf 'io_stall_percent=%s\n' "$io_stall"
 printf 'cpu_stall_percent=%s\n' "$cpu_stall"
 "#,
-        facts = NODE_FACTS_SNIPPET
+        facts = facts
     );
     match ssh_capture(host, &command) {
         Ok(output) => {
