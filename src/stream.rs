@@ -21,16 +21,15 @@ cleanup() { rm -rf "$dir"; }
 trap 'cleanup; exit 0' INT TERM HUP PIPE
 trap cleanup EXIT"#;
 
-// The three admin queries run at once. In sequence a tick cost their sum, which
-// pushed the real refresh period well past the configured interval. Each
-// redirect truncates its file before the query runs, so a failed query leaves an
-// empty file rather than the previous tick's value.
+// Prime every cache before the first payload. Steady-state refreshes keep
+// `ceph -s` fast and rotate the three detail queries below.
 pub(crate) const CLUSTER_STREAM_TICK: &str = r#"  sudo -n ceph -s --format json >"$dir/status" 2>/dev/null &
   sudo -n ceph osd tree --format json >"$dir/tree" 2>/dev/null &
   sudo -n ceph osd df --format json >"$dir/df" 2>/dev/null &
   sudo -n ceph osd perf --format json >"$dir/perf" 2>/dev/null &
-  wait
-  status=$(tr -d '\n' <"$dir/status")
+  wait"#;
+
+const CLUSTER_STREAM_EMIT: &str = r#"  status=$(tr -d '\n' <"$dir/status")
   tree=$(tr -d '\n' <"$dir/tree")
   df=$(tr -d '\n' <"$dir/df")
   perf=$(tr -d '\n' <"$dir/perf")
@@ -41,24 +40,42 @@ pub(crate) const CLUSTER_STREAM_TICK: &str = r#"  sudo -n ceph -s --format json 
     printf '{"type":"error","message":"ceph command failed"}\n'
   fi"#;
 
+fn cluster_stream_refresh_tick() -> String {
+    format!(
+        r#"  (sudo -n ceph -s --format json >"$dir/status.next" 2>/dev/null && mv "$dir/status.next" "$dir/status" || : >"$dir/status") &
+  case "$phase" in
+    0) (sudo -n ceph osd tree --format json >"$dir/tree.next" 2>/dev/null && mv "$dir/tree.next" "$dir/tree" || : >"$dir/tree") ;;
+    1) (sudo -n ceph osd df --format json >"$dir/df.next" 2>/dev/null && mv "$dir/df.next" "$dir/df" || : >"$dir/df") ;;
+    2) (sudo -n ceph osd perf --format json >"$dir/perf.next" 2>/dev/null && mv "$dir/perf.next" "$dir/perf" || : >"$dir/perf") ;;
+  esac &
+  wait
+  phase=$(( (phase + 1) % 3 ))
+{emit}"#,
+        emit = CLUSTER_STREAM_EMIT,
+    )
+}
+
 pub(crate) fn cluster_stream_command(interval_secs: u64) -> String {
+    let refresh_tick = cluster_stream_refresh_tick();
     format!(
         r#"
 {setup}
+{initial_tick}
+{emit}
+  sleep {interval_secs}
+phase=0
 while true; do
-{tick}
+{refresh_tick}
   sleep {interval_secs}
 done
 "#,
         setup = CLUSTER_STREAM_SETUP,
-        tick = CLUSTER_STREAM_TICK,
+        initial_tick = CLUSTER_STREAM_TICK,
+        emit = CLUSTER_STREAM_EMIT,
     )
 }
 
-// Shared node facts collection: sets hostname, sudo_state, ceph_version,
-// deployment, count, ids, and mem_pct shell variables. Used by both the
-// one-shot probe in collect.rs and the streaming loop below.
-pub(crate) const NODE_FACTS_SNIPPET: &str = r#"hostname=$(hostname)
+pub(crate) const NODE_STATIC_FACTS_SNIPPET: &str = r#"hostname=$(hostname)
 if sudo -n true 2>/dev/null; then sudo_state=ok; else sudo_state=needs_password; fi
 ceph_version=$(ceph --version 2>/dev/null | head -1)
 if [ -z "$ceph_version" ]; then ceph_version=missing; fi
@@ -70,27 +87,48 @@ elif command -v cephadm >/dev/null 2>&1; then
   deployment=cephadm
 elif [ -d /var/lib/rook ]; then
   deployment=rook
-fi
-# pgrep -c prints 0 and exits 1 when nothing matches, so `|| echo 0` would
+fi"#;
+
+pub(crate) const NODE_OSD_FACTS_SNIPPET: &str = r#"# pgrep -c prints 0 and exits 1 when nothing matches, so `|| echo 0` would
 # append a second line and break the JSON payload below.
 count=$(pgrep -c '[c]eph-osd' 2>/dev/null || true)
 count=${count:-0}
-ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id \([0-9][0-9]*\).*/\1/p' | paste -sd, -)
-mem_pct=$(awk '/MemTotal:/ {total=$2} /MemAvailable:/ {avail=$2} END {if (total > 0) printf "%.1f", (total-avail)*100/total; else printf "0.0"}' /proc/meminfo)
-# Pressure stall shares. Absent before Linux 4.20 and on kernels built without
-# PSI, in which case both stay 0.0.
-io_stall=$(awk '/^some/ {split($2,a,"="); printf "%.1f", a[2]; found=1; exit} END {if (!found) printf "0.0"}' /proc/pressure/io 2>/dev/null)
-io_stall=${io_stall:-0.0}
-cpu_stall=$(awk '/^some/ {split($2,a,"="); printf "%.1f", a[2]; found=1; exit} END {if (!found) printf "0.0"}' /proc/pressure/cpu 2>/dev/null)
-cpu_stall=${cpu_stall:-0.0}"#;
+ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id \([0-9][0-9]*\).*/\1/p' | paste -sd, -)"#;
+
+pub(crate) const NODE_DYNAMIC_FACTS_SNIPPET: &str = r#"pressure_files=""
+[ -r /proc/pressure/io ] && pressure_files="$pressure_files /proc/pressure/io"
+[ -r /proc/pressure/cpu ] && pressure_files="$pressure_files /proc/pressure/cpu"
+metrics=$(awk '
+  FILENAME == "/proc/meminfo" && $1 == "MemTotal:" { total=$2 }
+  FILENAME == "/proc/meminfo" && $1 == "MemAvailable:" { avail=$2 }
+  FILENAME == "/proc/pressure/io" && $1 == "some" { split($2,a,"="); io=a[2] }
+  FILENAME == "/proc/pressure/cpu" && $1 == "some" { split($2,a,"="); cpu=a[2] }
+  END {
+    mem=(total > 0) ? (total-avail)*100/total : 0
+    printf "%.1f %.1f %.1f", mem, io, cpu
+  }
+' /proc/meminfo $pressure_files 2>/dev/null)
+set -- $metrics
+mem_pct=${1:-0.0}
+io_stall=${2:-0.0}
+cpu_stall=${3:-0.0}"#;
+
+pub(crate) fn node_facts_snippet() -> String {
+    format!("{NODE_STATIC_FACTS_SNIPPET}\n{NODE_OSD_FACTS_SNIPPET}\n{NODE_DYNAMIC_FACTS_SNIPPET}")
+}
 
 pub(crate) fn node_stream_command(interval_secs: u64) -> String {
+    let interval_secs = interval_secs.max(1);
+    let osd_refresh_ticks = 5_u64.div_ceil(interval_secs);
     format!(
         r#"
+{static_facts}
+{osd_facts}
 prev_total=0
 prev_idle=0
+osd_ticks=0
 while true; do
-{facts}
+{dynamic_facts}
   read _ user nice system idle iowait irq softirq steal _ _ < /proc/stat
   idle_all=$((idle + iowait))
   non_idle=$((user + nice + system + irq + softirq + steal))
@@ -99,7 +137,8 @@ while true; do
     diff_total=$((total - prev_total))
     diff_idle=$((idle_all - prev_idle))
     if [ "$diff_total" -gt 0 ]; then
-      cpu_pct=$(awk -v total="$diff_total" -v idle="$diff_idle" 'BEGIN {{ printf "%.1f", (total-idle)*100/total }}')
+      cpu_tenths=$(( ((diff_total - diff_idle) * 1000 + diff_total / 2) / diff_total ))
+      cpu_pct="$((cpu_tenths / 10)).$((cpu_tenths % 10))"
     else
       cpu_pct=0.0
     fi
@@ -110,9 +149,16 @@ while true; do
   prev_idle=$idle_all
   printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
   sleep {interval_secs}
+  osd_ticks=$((osd_ticks + 1))
+  if [ "$osd_ticks" -ge {osd_refresh_ticks} ]; then
+{osd_facts}
+    osd_ticks=0
+  fi
 done
 "#,
-        facts = NODE_FACTS_SNIPPET,
+        static_facts = NODE_STATIC_FACTS_SNIPPET,
+        osd_facts = NODE_OSD_FACTS_SNIPPET,
+        dynamic_facts = NODE_DYNAMIC_FACTS_SNIPPET,
     )
 }
 
@@ -156,7 +202,7 @@ mod tests {
     fn node_facts_report_osd_count_as_a_bare_integer() {
         use std::process::Command;
 
-        let script = format!("{NODE_FACTS_SNIPPET}\nprintf '%s' \"$count\"");
+        let script = format!("{}\nprintf '%s' \"$count\"", node_facts_snippet());
         let output = Command::new("sh")
             .arg("-c")
             .arg(&script)
@@ -204,7 +250,7 @@ mod tests {
         (root, bin)
     }
 
-    // A sequential tick costs three stubbed sleeps and a concurrent one costs a
+    // A sequential tick costs four stubbed sleeps and a concurrent one costs a
     // single sleep. The bound sits between them with room on both sides so
     // ordinary scheduling noise cannot flip the result.
     #[cfg(target_os = "linux")]
@@ -214,7 +260,8 @@ mod tests {
 
         let (root, bin) = stub_admin_host("tick");
 
-        let script = format!("{CLUSTER_STREAM_SETUP}\n{CLUSTER_STREAM_TICK}\n");
+        let script =
+            format!("{CLUSTER_STREAM_SETUP}\n{CLUSTER_STREAM_TICK}\n{CLUSTER_STREAM_EMIT}\n");
         let started = Instant::now();
         let output = Command::new("sh")
             .arg("-c")
@@ -237,10 +284,51 @@ mod tests {
         assert!(value.pointer("/df").is_some());
         assert!(
             elapsed < QUERY_SECS * 2.0,
-            "tick took {elapsed:.2}s; three concurrent {QUERY_SECS}s queries should not approach \
+            "tick took {elapsed:.2}s; four concurrent {QUERY_SECS}s queries should not approach \
              the {:.2}s sequential cost",
-            QUERY_SECS * 3.0
+            QUERY_SECS * 4.0
         );
+    }
+
+    #[test]
+    fn cluster_stream_keeps_status_fast_and_rotates_detail_queries() {
+        let script = cluster_stream_command(1);
+
+        assert!(script.contains("case \"$phase\" in"));
+        assert!(script.contains("phase=$(( (phase + 1) % 3 ))"));
+        assert!(script.contains("|| : >\"$dir/status\""));
+        assert!(script.contains("|| : >\"$dir/tree\""));
+        assert!(script.contains("|| : >\"$dir/df\""));
+        assert!(script.contains("|| : >\"$dir/perf\""));
+        assert_eq!(script.matches("sudo -n ceph -s --format json").count(), 2);
+        assert_eq!(
+            script
+                .matches("sudo -n ceph osd tree --format json")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script.matches("sudo -n ceph osd df --format json").count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("sudo -n ceph osd perf --format json")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn node_stream_collects_static_facts_before_the_tick_loop() {
+        let script = node_stream_command(1);
+        let loop_start = script.find("while true; do").unwrap();
+        let hostname = script.find("hostname=$(hostname)").unwrap();
+        let microceph = script.find("snap list microceph").unwrap();
+
+        assert!(hostname < loop_start);
+        assert!(microceph < loop_start);
+        assert_eq!(script.matches("snap list microceph").count(), 1);
     }
 
     // Regression: the scratch dir the concurrent tick needs was left behind when
