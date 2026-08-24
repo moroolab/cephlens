@@ -16,6 +16,7 @@ use crate::diagnose::{DiagnoseInput, Insight, InsightLevel, diagnose, format_lat
 use crate::editor::ConfigDraft;
 use crate::flow::{FlowPath, FlowSource, FlowTree, build_flow_tree, flow_paths, flow_totals};
 use crate::kfstrace::kfs_op_rows;
+use crate::model::ClusterSummary;
 use crate::radostrace::rados_pool_rows;
 use crate::trace::{TraceGraphRow, trace_graph_rows as build_trace_graph_rows};
 use crate::util::{clamp_bottom_scroll, clamp_top_scroll, short};
@@ -1483,19 +1484,8 @@ fn config_row(
     .style(style)
 }
 
-fn draw_cluster(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(snapshot) = &app.snapshot else {
-        frame.render_widget(
-            Paragraph::new("Waiting for first snapshot...")
-                .style(Style::default().fg(MUTED))
-                .block(panel(" vitals ")),
-            area,
-        );
-        return;
-    };
-
-    let c = &snapshot.cluster;
-    let lines = vec![
+fn cluster_lines(c: &ClusterSummary) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(vec![
             label("health"),
             pill(&c.health, health_color(&c.health)),
@@ -1518,8 +1508,33 @@ fn draw_cluster(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(TEXT),
             ),
         ]),
-        kv_line("pg", &c.pg_states, TEXT),
     ];
+
+    let mut pg_iter = c.pg_states.split(", ").filter(|s| !s.is_empty());
+    if let Some(first) = pg_iter.next() {
+        lines.push(kv_line("pg", first, TEXT));
+        for rest in pg_iter {
+            lines.push(kv_line("", rest, TEXT));
+        }
+    } else {
+        lines.push(kv_line("pg", "-", MUTED));
+    }
+
+    lines
+}
+
+fn draw_cluster(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        frame.render_widget(
+            Paragraph::new("Waiting for first snapshot...")
+                .style(Style::default().fg(MUTED))
+                .block(panel(" vitals ")),
+            area,
+        );
+        return;
+    };
+
+    let lines = cluster_lines(&snapshot.cluster);
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().fg(TEXT))
@@ -2106,5 +2121,50 @@ mod tests {
 
         let rendered = buffer_text(terminal.backend().buffer());
         assert_eq!(rendered.matches('→').count(), 1);
+    }
+
+    #[test]
+    fn cluster_lines_splits_multiple_pg_states() {
+        let summary = ClusterSummary {
+            health: "HEALTH_OK".to_owned(),
+            pg_states: "128 active+clean, 32 active+undersized".to_owned(),
+            ..ClusterSummary::default()
+        };
+        let lines = cluster_lines(&summary);
+        assert_eq!(lines.len(), 7);
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines).block(panel(" vitals ")), frame.area());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("pg      128 active+clean"));
+        assert!(rendered.contains("        32 active+undersized"));
+    }
+
+    #[test]
+    fn cluster_lines_handles_empty_pg_state() {
+        let summary = ClusterSummary {
+            health: "HEALTH_OK".to_owned(),
+            pg_states: String::new(),
+            ..ClusterSummary::default()
+        };
+        let lines = cluster_lines(&summary);
+        assert_eq!(lines.len(), 6);
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines).block(panel(" vitals ")), frame.area());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("pg      -"));
     }
 }
