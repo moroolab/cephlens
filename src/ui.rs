@@ -29,9 +29,9 @@ const BAD: Color = Color::Rgb(255, 83, 112);
 const MUTED: Color = Color::Rgb(91, 99, 112);
 const TEXT: Color = Color::Rgb(198, 208, 219);
 
-pub(crate) const MIN_TERMINAL_WIDTH: u16 = 100;
-pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 32;
-const RECOMMENDED_TERMINAL_WIDTH: u16 = 142;
+pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
+pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 20;
+const RECOMMENDED_TERMINAL_WIDTH: u16 = 110;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -114,7 +114,7 @@ fn draw_terminal_size_gate(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(" quit"),
         ]),
     ];
-    let modal = centered_rect(72, 10, area);
+    let modal = centered_rect(60, 10, area);
     frame.render_widget(
         Paragraph::new(lines)
             .alignment(Alignment::Center)
@@ -343,7 +343,7 @@ fn draw_live_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.height < 12 {
+    if area.height < 10 {
         draw_overview(frame, app, area);
         return;
     }
@@ -438,7 +438,19 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         draw_cluster(frame, app, chunks[0]);
         draw_nodes(frame, app, chunks[1]);
         draw_osds(frame, app, chunks[2]);
-    } else if area.width >= 82 {
+    } else if area.width >= 110 && area.height >= 8 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(28),
+                Constraint::Length(40),
+                Constraint::Min(38),
+            ])
+            .split(area);
+        draw_cluster(frame, app, chunks[0]);
+        draw_nodes(frame, app, chunks[1]);
+        draw_osds(frame, app, chunks[2]);
+    } else if area.width >= 72 {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
@@ -2323,8 +2335,8 @@ mod tests {
             }],
         });
 
-        // 100 cols wide is < 142 (narrow mode)
-        let backend = TestBackend::new(100, 10);
+        // 90 cols wide is < 110 (2-panel mode)
+        let backend = TestBackend::new(90, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Focused on Osds -> shows osd map
@@ -2348,5 +2360,40 @@ mod tests {
         let rendered_nodes = buffer_text(terminal.backend().buffer());
         assert!(rendered_nodes.contains("nodes"));
         assert!(!rendered_nodes.contains("osd map"));
+    }
+
+    #[test]
+    fn overview_medium_displays_all_three_panels() {
+        let mut app = test_app();
+        app.snapshot = Some(Snapshot {
+            captured_at: chrono::Utc::now(),
+            profile: "test".to_owned(),
+            admin_host: "host1".to_owned(),
+            hosts: vec!["host1".to_owned()],
+            trace_window_secs: 10,
+            cluster: ClusterSummary::default(),
+            nodes: Vec::new(),
+            osds: vec![OsdSummary {
+                name: "osd.0".to_owned(),
+                host: "host1".to_owned(),
+                status: "up".to_owned(),
+                reweight: 1.0,
+                ..OsdSummary::default()
+            }],
+        });
+
+        // 115 cols wide is >= 110 (3-panel mode)
+        let backend = TestBackend::new(115, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_overview(frame, &app, frame.area());
+            })
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("vitals"));
+        assert!(rendered.contains("nodes"));
+        assert!(rendered.contains("osd map"));
     }
 }
