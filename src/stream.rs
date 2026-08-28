@@ -264,12 +264,12 @@ pub(crate) fn parse_inflight_ops(encoded: &str) -> Vec<InflightOp> {
 }
 
 fn decode_hex(value: &str) -> Option<String> {
-    if !value.len().is_multiple_of(2) {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
-    let bytes = value
-        .as_bytes()
-        .chunks_exact(2)
+    let bytes = pairs
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char).to_digit(16)?;
             let low = (pair[1] as char).to_digit(16)?;
