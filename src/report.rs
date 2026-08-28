@@ -12,10 +12,10 @@ use crate::{
     diagnose::{DiagnoseInput, InsightLevel, diagnose, format_latency_us},
     kfstrace::{KfsEvent, kfs_op_rows, parse_kfs_event},
     model::{NodeSummary, Snapshot},
-    radostrace::{RadosEvent, parse_rados_event, rados_pool_rows},
+    radostrace::{RadosEvent, parse_rados_event_at, rados_pool_rows},
     session::{TRACE_KFS_LOG, TRACE_OSD_LOG, TRACE_RADOS_LOG, load_snapshots},
     trace::{
-        TRACE_BUCKET_SECS, TraceBucket, TraceEvent, parse_trace_event, record_trace_event_at,
+        TRACE_BUCKET_SECS, TraceBucket, TraceEvent, parse_trace_event_at, record_trace_event_at,
         trace_graph_rows_at,
     },
 };
@@ -109,7 +109,9 @@ fn load_trace_logs(dir: Option<&Path>, trace_window_secs: u64) -> Result<TraceLo
     let mut logs = TraceLogs::default();
     load_trace_payloads(&dir.join(TRACE_OSD_LOG), |stamp, host, payload| {
         logs.osd_lines += 1;
-        if let Some(event) = parse_trace_event(host, payload) {
+        if let Some(event) =
+            parse_trace_event_at(host, payload, trace_timestamp(stamp).unwrap_or(0))
+        {
             if event.op == "error" {
                 logs.osd_errors += 1;
             }
@@ -130,12 +132,12 @@ fn load_trace_logs(dir: Option<&Path>, trace_window_secs: u64) -> Result<TraceLo
             logs.kfs_events.push(event);
         }
     })?;
-    load_trace_payloads(&dir.join(TRACE_RADOS_LOG), |_, _, payload| {
+    load_trace_payloads(&dir.join(TRACE_RADOS_LOG), |stamp, _, payload| {
         logs.rados_lines += 1;
         if payload.starts_with("__CEPHLENS_RADOS_ERROR__") {
             logs.rados_errors += 1;
         }
-        if let Some(event) = parse_rados_event(payload) {
+        if let Some(event) = parse_rados_event_at(payload, trace_timestamp(stamp).unwrap_or(0)) {
             logs.rados_events.push(event);
         }
     })?;
@@ -162,9 +164,13 @@ fn load_trace_payloads(path: &Path, mut handle: impl FnMut(&str, &str, &str)) ->
 }
 
 fn trace_bucket(stamp: &str) -> Option<i64> {
+    trace_timestamp(stamp).map(|timestamp| timestamp / TRACE_BUCKET_SECS)
+}
+
+fn trace_timestamp(stamp: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(stamp)
         .ok()
-        .map(|time| time.timestamp() / TRACE_BUCKET_SECS)
+        .map(|time| time.timestamp())
 }
 
 fn trace_log_dir(path: &Path) -> Option<PathBuf> {
@@ -542,7 +548,7 @@ mod tests {
         let report = build_report(&dir).unwrap();
 
         assert!(report.contains("Trace window: 10s"));
-        assert!(report.contains("largest observed component queue 20.0ms"));
+        assert!(report.contains("largest observed component queue on osd.1 20.0ms"));
         assert!(report.contains("- Parsed events: osd `1`, kfs `0`, rados `0`"));
         assert!(report.contains(
             "| node-a | node-a | ok | - | - | 90.0% | 0.0% | generic | ceph version test | - |"

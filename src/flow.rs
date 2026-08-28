@@ -63,6 +63,9 @@ impl FlowSort {
 pub(crate) enum FlowSource {
     /// radostrace: OSD, PG, and object.
     Rados,
+    /// osdtrace keeps replica OSDs while radostrace adds object names to the
+    /// matching primary branches.
+    Combined,
     /// osdtrace: OSD and PG only.
     Osd,
     Empty,
@@ -142,7 +145,7 @@ pub(crate) fn flow_paths(tree: &FlowTree) -> Vec<FlowPath> {
     let mut osd: Option<(String, String)> = None;
     let mut pg: Option<(String, String)> = None;
 
-    for row in &tree.rows {
+    for (index, row) in tree.rows.iter().enumerate() {
         match row.depth {
             0 => {
                 osd = Some((row.label.clone(), row.detail.clone()));
@@ -150,7 +153,12 @@ pub(crate) fn flow_paths(tree: &FlowTree) -> Vec<FlowPath> {
             }
             1 => {
                 pg = Some((row.label.clone(), row.detail.clone()));
-                if tree.source == FlowSource::Osd
+                let has_object = tree
+                    .rows
+                    .get(index + 1)
+                    .is_some_and(|next| next.depth > row.depth);
+                if (tree.source == FlowSource::Osd || tree.source == FlowSource::Combined)
+                    && !has_object
                     && let Some((osd, host)) = &osd
                 {
                     paths.push(FlowPath {
@@ -194,8 +202,9 @@ impl Branch {
     }
 }
 
-/// Builds the tree, preferring radostrace because it can name objects. Falls
-/// back to osdtrace when no RADOS client op has been seen.
+/// Builds one tree from both sources. osdtrace owns OSD and PG totals so
+/// replica rows stay visible; radostrace enriches primary branches with object
+/// names. A single available source retains its original shape.
 pub(crate) fn build_flow_tree(
     rados_events: &[RadosEvent],
     trace_events: &[TraceEvent],
@@ -205,10 +214,14 @@ pub(crate) fn build_flow_tree(
     max_osds: usize,
     max_children: usize,
 ) -> FlowTree {
-    let (roots, source) = if rados_events.is_empty() {
-        (osd_roots(trace_events), FlowSource::Osd)
-    } else {
-        (rados_roots(rados_events, host_by_osd_id), FlowSource::Rados)
+    let (roots, source) = match (rados_events.is_empty(), trace_events.is_empty()) {
+        (true, false) => (osd_roots(trace_events), FlowSource::Osd),
+        (false, true) => (rados_roots(rados_events, host_by_osd_id), FlowSource::Rados),
+        (false, false) => (
+            combined_roots(rados_events, trace_events, host_by_osd_id),
+            FlowSource::Combined,
+        ),
+        (true, true) => (Branch::default(), FlowSource::Empty),
     };
     if roots.children.is_empty() {
         return FlowTree {
@@ -220,6 +233,39 @@ pub(crate) fn build_flow_tree(
         source,
         rows: flatten(roots, metric, sort, max_osds, max_children),
     }
+}
+
+fn combined_roots(
+    rados_events: &[RadosEvent],
+    trace_events: &[TraceEvent],
+    host_by_osd_id: &HashMap<i64, String>,
+) -> Branch {
+    let mut root = osd_roots(trace_events);
+    for event in rados_events {
+        let Some(primary) = event.acting.first().copied().filter(|id| *id >= 0) else {
+            continue;
+        };
+        let osd_key = format!("osd.{primary}");
+        let osd_missing = !root.children.contains_key(&osd_key);
+        let osd = root.child(&osd_key);
+        if osd.detail.is_empty() {
+            osd.detail = host_by_osd_id.get(&primary).cloned().unwrap_or_default();
+        }
+        if osd_missing {
+            osd.stats.record(event.latency_us, event.size_bytes);
+        }
+
+        let pg_missing = !osd.children.contains_key(&event.pg);
+        let pg = osd.child(&event.pg);
+        pg.detail = format_acting(&event.acting);
+        if pg_missing {
+            pg.stats.record(event.latency_us, event.size_bytes);
+        }
+        pg.child(&event.object)
+            .stats
+            .record(event.latency_us, event.size_bytes);
+    }
+    root
 }
 
 fn rados_roots(events: &[RadosEvent], host_by_osd_id: &HashMap<i64, String>) -> Branch {
@@ -356,6 +402,7 @@ mod tests {
 
     fn osd_event(host: &str, osd: &str, pg: &str, op_lat_us: u64) -> TraceEvent {
         TraceEvent {
+            observed_at: chrono::Utc::now().timestamp(),
             host: host.to_owned(),
             osd: osd.to_owned(),
             pg: pg.to_owned(),
@@ -368,6 +415,7 @@ mod tests {
             queue_lat_us: 0,
             bluestore_lat_us: 0,
             kv_commit_us: 0,
+            peers: Vec::new(),
             raw: String::new(),
         }
     }
@@ -521,9 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn rados_wins_when_both_sources_have_data() {
+    fn both_sources_keep_replica_osds_and_object_names() {
         let rados_events = vec![rados("1 1 1 2 01 [1,2,3] W 4096 10 obj [write][0,4096]")];
-        let trace_events = vec![osd_event("node-a", "9", "9.9", 99_999)];
+        let trace_events = vec![
+            osd_event("node-a", "1", "2.01", 10),
+            osd_event("node-b", "9", "2.01", 99_999),
+        ];
 
         let tree = build_flow_tree(
             &rados_events,
@@ -535,8 +586,10 @@ mod tests {
             8,
         );
 
-        assert_eq!(tree.source, FlowSource::Rados);
-        assert_eq!(tree.rows[0].label, "osd.1");
+        assert_eq!(tree.source, FlowSource::Combined);
+        assert!(tree.rows.iter().any(|row| row.label == "osd.9"));
+        assert!(tree.rows.iter().any(|row| row.label == "obj"));
+        assert_eq!(flow_paths(&tree).len(), 2);
     }
 
     // A 4MiB op that takes 40ms and a 4KiB op that takes 40ms rank the same by

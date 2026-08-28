@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use chrono::Utc;
+
 // radostrace (cephtrace librados-client tracer) output, e.g.:
 //   15915  89499  8  2  2  [4,2,3]  W  4096  9023  bench..._object7 [set-alloc-hint write][0, 4096]
 // columns: pid client tid pool pg acting WR size latency(us) object[ops]
@@ -7,6 +9,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RadosEvent {
+    pub(crate) observed_at: i64,
     pub(crate) pool: String,
     /// Full `pool.seq` placement group id built from the pool and pg columns.
     pub(crate) pg: String,
@@ -32,6 +35,10 @@ pub(crate) struct RadosPoolRow {
 }
 
 pub(crate) fn parse_rados_event(line: &str) -> Option<RadosEvent> {
+    parse_rados_event_at(line, Utc::now().timestamp())
+}
+
+pub(crate) fn parse_rados_event_at(line: &str, observed_at: i64) -> Option<RadosEvent> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     // pid client tid pool pg acting WR size latency + at least one object token
     if tokens.len() < 10 || !tokens[0].chars().all(|ch| ch.is_ascii_digit()) {
@@ -43,6 +50,7 @@ pub(crate) fn parse_rados_event(line: &str) -> Option<RadosEvent> {
         _ => return None,
     };
     Some(RadosEvent {
+        observed_at,
         pool: tokens[3].to_owned(),
         pg: format!("{}.{}", tokens[3], tokens[4]),
         acting: parse_acting(tokens[5]),

@@ -92,6 +92,7 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
     }
 
     insights.extend(io_limit_insights(input.node_summaries));
+    insights.extend(inflight_op_insights(input.node_summaries));
 
     if let Some(error) = input
         .trace_events
@@ -261,6 +262,39 @@ fn io_limit_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<Insig
         .collect()
 }
 
+fn inflight_op_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<Insight> {
+    let mut operations = node_summaries
+        .values()
+        .flat_map(|node| {
+            node.osd_inflight_ops
+                .iter()
+                .map(move |operation| (node, operation))
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by(|(left_node, left), (right_node, right)| {
+        right
+            .age_seconds
+            .total_cmp(&left.age_seconds)
+            .then_with(|| left_node.host.cmp(&right_node.host))
+            .then_with(|| left.osd.cmp(&right.osd))
+    });
+    operations
+        .into_iter()
+        .take(4)
+        .map(|(node, operation)| Insight {
+            level: InsightLevel::Bad,
+            text: format!(
+                "{} {} in-flight {:.1}s at {}: {}",
+                node.host,
+                operation.osd,
+                operation.age_seconds,
+                short(&operation.flag_point, 36),
+                short(&operation.description, 100)
+            ),
+        })
+        .collect()
+}
+
 fn format_osd_set(osds: &[i64]) -> String {
     format!(
         "[{}]",
@@ -340,27 +374,52 @@ fn osd_trace_insights(
         ),
     });
 
-    if worst.queue_max_us > 0 || worst.recv_max_us > 0 {
+    let queue_worst = component_worst(active_rows, |row| row.queue_max_us);
+    let recv_worst = component_worst(active_rows, |row| row.recv_max_us);
+    if queue_worst.queue_max_us >= 10_000 || recv_worst.recv_max_us >= 10_000 {
         insights.push(Insight {
-            level: insight_level_for_latency(worst.queue_max_us.max(worst.recv_max_us)),
+            level: insight_level_for_latency(queue_worst.queue_max_us.max(recv_worst.recv_max_us)),
             text: format!(
-                "compare {} / {}: queue {} · recv {} → {}",
-                worst.osd,
-                worst.host,
-                format_latency_us(worst.queue_max_us),
-                format_latency_us(worst.recv_max_us),
-                queue_recv_verdict(worst.queue_max_us, worst.recv_max_us)
+                "component leaders: queue {} {} · recv {} {}",
+                queue_worst.osd,
+                format_latency_us(queue_worst.queue_max_us),
+                recv_worst.osd,
+                format_latency_us(recv_worst.recv_max_us),
             ),
         });
     }
 
-    let dominant = dominant_component(worst);
+    let peer_worst = component_worst(active_rows, |row| row.peer_max_us);
+    if peer_worst.peer_max_us >= 10_000 && !peer_worst.slow_peer.is_empty() {
+        let peer_row = active_rows
+            .iter()
+            .find(|row| row.osd == peer_worst.slow_peer)
+            .copied();
+        let verdict = peer_wait_verdict(peer_row);
+        insights.push(Insight {
+            level: insight_level_for_latency(peer_worst.peer_max_us),
+            text: format!(
+                "{} waited {} for {} replica reply → {}",
+                peer_worst.osd,
+                format_latency_us(peer_worst.peer_max_us),
+                peer_worst.slow_peer,
+                verdict
+            ),
+        });
+    }
+
+    let (component_row, dominant) = active_rows
+        .iter()
+        .map(|row| (*row, dominant_component(row)))
+        .max_by_key(|(_, component)| component.value_us)
+        .expect("active_rows is not empty");
     if dominant.value_us > 0 {
         insights.push(Insight {
             level: insight_level_for_latency(dominant.value_us),
             text: format!(
-                "largest observed component {} {}; possible area {}; maxima may be from different ops",
+                "largest observed component {} on {} {}; possible area {}; maxima may be from different ops",
                 dominant.name,
+                component_row.osd,
                 format_latency_us(dominant.value_us),
                 dominant.suspect
             ),
@@ -426,14 +485,41 @@ fn osd_trace_insights(
     insights
 }
 
-fn queue_recv_verdict(queue_us: u64, recv_us: u64) -> &'static str {
-    const CLEAR_DELAY_US: u64 = 10_000;
-    if queue_us >= CLEAR_DELAY_US && queue_us >= recv_us.saturating_mul(2) {
-        "queue is at least 2x recv; OSD queue delay likely"
-    } else if recv_us >= CLEAR_DELAY_US && recv_us >= queue_us.saturating_mul(2) {
-        "recv is at least 2x queue; network receive delay likely"
+fn component_worst<'a>(
+    active_rows: &'a [&TraceGraphRow],
+    value: impl Fn(&TraceGraphRow) -> u64,
+) -> &'a TraceGraphRow {
+    active_rows
+        .iter()
+        .max_by_key(|row| value(row))
+        .copied()
+        .expect("active_rows is not empty")
+}
+
+fn peer_wait_verdict(peer: Option<&TraceGraphRow>) -> String {
+    let Some(peer) = peer else {
+        return "peer trace row missing; inspect network and peer OSD".to_owned();
+    };
+    if peer.queue_max_us >= 10_000 && peer.queue_max_us >= peer.recv_max_us.saturating_mul(2) {
+        format!(
+            "{} queue {} is high; peer OSD queue delay likely",
+            peer.osd,
+            format_latency_us(peer.queue_max_us)
+        )
+    } else if peer.recv_max_us >= 10_000 && peer.recv_max_us >= peer.queue_max_us.saturating_mul(2)
+    {
+        format!(
+            "{} recv {} is high; request network receive path likely",
+            peer.osd,
+            format_latency_us(peer.recv_max_us)
+        )
     } else {
-        "no clear queue/recv lead"
+        format!(
+            "{} queue {} / recv {} stay low; replica response network path likely",
+            peer.osd,
+            format_latency_us(peer.queue_max_us),
+            format_latency_us(peer.recv_max_us)
+        )
     }
 }
 
@@ -547,7 +633,7 @@ fn node_for_host<'a>(
 mod tests {
     use super::*;
     use crate::{
-        model::{ClusterSummary, OsdSummary, PgSummary, PoolSummary},
+        model::{ClusterSummary, InflightOp, OsdSummary, PgSummary, PoolSummary},
         radostrace::parse_rados_event,
     };
 
@@ -583,6 +669,8 @@ mod tests {
             queue_max_us: queue_us,
             store_max_us: 0,
             kv_commit_max_us: 0,
+            peer_max_us: 0,
+            slow_peer: String::new(),
             pg_count: 1,
             hot_pg: "1.a:2".to_owned(),
             points: Vec::new(),
@@ -618,12 +706,12 @@ mod tests {
         assert!(insights.iter().any(|insight| {
             insight
                 .text
-                .contains("largest observed component queue 20.0ms")
+                .contains("largest observed component queue on osd.1 20.0ms")
         }));
         assert!(insights.iter().any(|insight| {
             insight
                 .text
-                .contains("queue is at least 2x recv; OSD queue delay likely")
+                .contains("component leaders: queue osd.1 20.0ms")
         }));
         assert!(
             insights
@@ -653,20 +741,25 @@ mod tests {
     }
 
     #[test]
-    fn queue_and_receive_comparison_names_the_workshop_fault_class() {
-        assert_eq!(
-            queue_recv_verdict(50_000, 100),
-            "queue is at least 2x recv; OSD queue delay likely"
-        );
-        assert_eq!(
-            queue_recv_verdict(100, 50_000),
-            "recv is at least 2x queue; network receive delay likely"
-        );
-        assert_eq!(queue_recv_verdict(9_000, 100), "no clear queue/recv lead");
-        assert_eq!(
-            queue_recv_verdict(50_000, 30_000),
-            "no clear queue/recv lead"
-        );
+    fn peer_wait_distinguishes_replica_queue_from_response_network() {
+        let mut primary = row("osd.1", "node-a", 60_000, 100);
+        primary.peer_max_us = 50_000;
+        primary.slow_peer = "osd.2".to_owned();
+        let queued_peer = row("osd.2", "node-b", 55_000, 45_000);
+        let queued = osd_trace_insights(&HashMap::new(), &[&primary, &queued_peer], 10);
+        assert!(queued.iter().any(|insight| {
+            insight
+                .text
+                .contains("osd.2 queue 45.0ms is high; peer OSD queue delay likely")
+        }));
+
+        let quiet_peer = row("osd.2", "node-b", 1_000, 100);
+        let network = osd_trace_insights(&HashMap::new(), &[&primary, &quiet_peer], 10);
+        assert!(network.iter().any(|insight| {
+            insight
+                .text
+                .contains("queue 100us / recv - stay low; replica response network path likely")
+        }));
     }
 
     #[test]
@@ -748,5 +841,23 @@ mod tests {
         assert_eq!(limits.len(), 1);
         assert!(limits[0].text.contains("node-b OSD block write limit"));
         assert!(limits[0].text.contains("osd.2"));
+
+        let nodes = HashMap::from([(
+            "node-b".to_owned(),
+            NodeSummary {
+                host: "node-b".to_owned(),
+                osd_inflight_ops: vec![InflightOp {
+                    osd: "osd.2".to_owned(),
+                    age_seconds: 31.5,
+                    flag_point: "waiting for subops from 2".to_owned(),
+                    description: "osd_op(client.1.0:7 2.a object [write 0~4096])".to_owned(),
+                }],
+                ..NodeSummary::default()
+            },
+        )]);
+        let inflight = inflight_op_insights(&nodes);
+        assert_eq!(inflight.len(), 1);
+        assert!(inflight[0].text.contains("node-b osd.2 in-flight 31.5s"));
+        assert!(inflight[0].text.contains("object"));
     }
 }

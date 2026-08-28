@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::Utc;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -10,9 +11,9 @@ use ratatui::{
 
 use crate::app::{
     App, EVENT_LOG_MIN_HEIGHT, EVENT_LOG_RESERVED_ROWS, Mode, PanelFocus, StreamState,
-    StreamStatus, TraceAction, TraceSource, live_streams_active,
+    StreamStatus, TraceAction, TraceSource, live_streams_active, operator_insights,
 };
-use crate::diagnose::{DiagnoseInput, Insight, InsightLevel, diagnose, format_latency_us};
+use crate::diagnose::{Insight, InsightLevel, format_latency_us};
 use crate::editor::ConfigDraft;
 use crate::flow::{FlowPath, FlowSource, FlowTree, build_flow_tree, flow_paths, flow_totals};
 use crate::kfstrace::kfs_op_rows;
@@ -671,7 +672,7 @@ fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(scroll_panel(
                 app,
                 PanelFocus::Insights,
-                "insights",
+                "insights · current + 15m history",
                 total,
                 visible,
                 scroll,
@@ -681,29 +682,6 @@ fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .wrap(Wrap { trim: true }),
         area,
     );
-}
-
-fn operator_insights(app: &App) -> Vec<Insight> {
-    let trace_rows = trace_graph_rows(app, usize::MAX);
-    let trace_running =
-        app.trace_active > 0 || app.kfstrace_active > 0 || app.radostrace_active > 0;
-    let idle_message = if trace_running {
-        "trace is running with no matching events yet; workload may be idle or below the threshold"
-    } else {
-        "no trace data; press t/f/r to start osd/kfs/rados, a for all"
-    };
-    diagnose(DiagnoseInput {
-        snapshot: app.snapshot.as_ref(),
-        admin_host: &app.admin_host,
-        node_summaries: &app.node_summaries,
-        stream_counts: Some(stream_counts(app)),
-        trace_window_secs: app.trace_window_secs,
-        trace_events: &app.trace_events,
-        trace_rows: &trace_rows,
-        kfs_events: &app.kfstrace_events,
-        rados_events: &app.radostrace_events,
-        idle_message: Some(idle_message),
-    })
 }
 
 fn insight_line(insight: Insight) -> Line<'static> {
@@ -892,7 +870,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let visible = table_visible_rows(area);
-    let compact = area.width < 104;
+    let compact = area.width < 113;
     let trace_active = app.trace_following || app.trace_active > 0;
     let graph_rows = trace_graph_rows(app, usize::MAX);
     let graph_total = graph_rows.len();
@@ -910,12 +888,14 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
+                Cell::from("-"),
                 Cell::from("0").style(Style::default().fg(MUTED)),
                 Cell::from("-"),
                 Cell::from(hint).style(Style::default().fg(MUTED)),
             ])]
         } else {
             vec![Row::new(vec![
+                Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("0").style(Style::default().fg(MUTED)),
@@ -937,9 +917,9 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .map(|row| {
                 let max_color = latency_color(row.max_us);
                 let graph_width = if compact {
-                    area.width.saturating_sub(64) as usize
+                    area.width.saturating_sub(71) as usize
                 } else {
-                    area.width.saturating_sub(99) as usize
+                    area.width.saturating_sub(113) as usize
                 }
                 .max(12);
                 let graph = trace_sparkline(&row.points, graph_width, trace_active);
@@ -951,6 +931,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                             .style(Style::default().fg(max_color)),
                         Cell::from(format_latency_us(row.queue_max_us)),
                         Cell::from(format_latency_us(row.recv_max_us)),
+                        Cell::from(format_latency_us(row.peer_max_us)),
                         Cell::from(row.pg_count.to_string()).style(trace_ops_style(row.ops)),
                         Cell::from(short(&row.hot_pg, 15)).style(Style::default().fg(BLUE)),
                         Cell::from(graph).style(Style::default().fg(max_color)),
@@ -965,6 +946,15 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                             .style(Style::default().fg(max_color)),
                         Cell::from(format_latency_us(row.queue_max_us)),
                         Cell::from(format_latency_us(row.recv_max_us)),
+                        Cell::from(if row.peer_max_us > 0 {
+                            format!(
+                                "{} {}",
+                                short(&row.slow_peer, 6),
+                                format_latency_us(row.peer_max_us)
+                            )
+                        } else {
+                            "-".to_owned()
+                        }),
                         Cell::from(format_latency_us(row.store_max_us)),
                         Cell::from(row.pg_count.to_string()).style(trace_ops_style(row.ops)),
                         Cell::from(short(&row.hot_pg, 21)).style(Style::default().fg(BLUE)),
@@ -983,12 +973,13 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(7),
+                Constraint::Length(7),
                 Constraint::Length(5),
                 Constraint::Length(15),
                 Constraint::Min(12),
             ],
             Row::new([
-                "OSD", "Ops", "Max", "Queue", "Recv", "PGs", "Busy PG", "Max/2s",
+                "OSD", "Ops", "Max", "Queue", "Recv", "Peer", "PGs", "Busy PG", "Max/2s",
             ]),
         )
     } else {
@@ -1001,13 +992,24 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(7),
+                Constraint::Length(13),
                 Constraint::Length(7),
                 Constraint::Length(5),
                 Constraint::Length(21),
                 Constraint::Min(16),
             ],
             Row::new([
-                "OSD", "Host", "Ops", "Avg", "Max", "Queue", "Recv", "Store", "PGs", "Busy PG",
+                "OSD",
+                "Host",
+                "Ops",
+                "Avg",
+                "Max",
+                "Queue",
+                "Recv",
+                "Peer wait",
+                "Store",
+                "PGs",
+                "Busy PG",
                 "Max/2s",
             ]),
         )
@@ -1035,9 +1037,22 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
     const MAX_OSDS: usize = 12;
     const MAX_CHILDREN: usize = 6;
 
+    let cutoff = Utc::now().timestamp() - app.trace_window_secs.max(1) as i64;
+    let rados_events = app
+        .radostrace_events
+        .iter()
+        .filter(|event| event.observed_at >= cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_events = app
+        .trace_events
+        .iter()
+        .filter(|event| event.observed_at >= cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
     let tree = build_flow_tree(
-        &app.radostrace_events,
-        &app.trace_events,
+        &rados_events,
+        &trace_events,
         &host_by_osd_id(app),
         app.flow_metric,
         app.flow_sort,
@@ -1130,6 +1145,7 @@ fn draw_flow(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn flow_panel_title(app: &App, tree: &FlowTree, path_count: usize) -> String {
     let level = match tree.source {
         FlowSource::Rados => "osd → pg → object",
+        FlowSource::Combined => "osd → pg + object",
         FlowSource::Osd => "osd → pg",
         FlowSource::Empty => "idle",
     };
@@ -2292,6 +2308,7 @@ mod tests {
             nodes_scroll: 0,
             osds_scroll: 0,
             insights_scroll: 0,
+            insight_history: std::collections::VecDeque::new(),
             trace_scroll: 0,
             logs_scroll: 0,
             node_summaries: HashMap::new(),

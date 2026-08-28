@@ -84,6 +84,8 @@ pub(crate) struct NodeSummary {
     #[serde(default)]
     pub(crate) osd_io_write_limits: String,
     #[serde(default)]
+    pub(crate) osd_inflight_ops: Vec<InflightOp>,
+    #[serde(default)]
     pub(crate) cpu_percent: f64,
     #[serde(default)]
     pub(crate) mem_percent: f64,
@@ -95,6 +97,14 @@ pub(crate) struct NodeSummary {
     #[serde(default)]
     pub(crate) cpu_stall_percent: f64,
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct InflightOp {
+    pub(crate) osd: String,
+    pub(crate) age_seconds: f64,
+    pub(crate) flag_point: String,
+    pub(crate) description: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

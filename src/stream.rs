@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::{
-    model::NodeSummary,
+    model::{InflightOp, NodeSummary},
     util::{ptr_f64, ptr_str, ptr_u64},
 };
 
@@ -123,7 +123,18 @@ for pid in $(pgrep -x ceph-osd 2>/dev/null || true); do
     if [ -n "$io_limits" ]; then io_limits="$io_limits; "; fi
     io_limits="${io_limits}osd.${osd_id}: ${limit}"
   fi
-done"#;
+done
+inflight_hex=""
+if [ -n "$io_limits" ]; then
+  for osd_id in $(printf '%s' "$ids" | tr ',' ' '); do
+    encoded=$(sudo -n ceph daemon "osd.$osd_id" dump_ops_in_flight 2>/dev/null |
+      head -c 32768 | od -An -tx1 | tr -d ' \n')
+    if [ -n "$encoded" ]; then
+      if [ -n "$inflight_hex" ]; then inflight_hex="$inflight_hex;"; fi
+      inflight_hex="${inflight_hex}${osd_id}=${encoded}"
+    fi
+  done
+fi"#;
 
 pub(crate) const NODE_DYNAMIC_FACTS_SNIPPET: &str = r#"pressure_files=""
 [ -r /proc/pressure/io ] && pressure_files="$pressure_files /proc/pressure/io"
@@ -177,7 +188,7 @@ while true; do
   fi
   prev_total=$total
   prev_idle=$idle_all
-  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","osd_io_write_limits":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$io_limits" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
+  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","osd_io_write_limits":"%s","osd_inflight_hex":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$io_limits" "$inflight_hex" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
   sleep {interval_secs}
   osd_ticks=$((osd_ticks + 1))
   if [ "$osd_ticks" -ge {osd_refresh_ticks} ]; then
@@ -213,12 +224,59 @@ pub(crate) fn parse_node_stream_payload(host: &str, payload: &str) -> Result<Nod
         ceph_osd_processes: ptr_u64(&value, "/ceph_osd_processes"),
         osd_ids: ptr_str(&value, "/osd_ids"),
         osd_io_write_limits: ptr_str(&value, "/osd_io_write_limits"),
+        osd_inflight_ops: parse_inflight_ops(&ptr_str(&value, "/osd_inflight_hex")),
         cpu_percent: ptr_f64(&value, "/cpu_percent"),
         mem_percent: ptr_f64(&value, "/mem_percent"),
         io_stall_percent: ptr_f64(&value, "/io_stall_percent"),
         cpu_stall_percent: ptr_f64(&value, "/cpu_stall_percent"),
         error: None,
     })
+}
+
+pub(crate) fn parse_inflight_ops(encoded: &str) -> Vec<InflightOp> {
+    let mut parsed = encoded
+        .split(';')
+        .filter_map(|entry| {
+            let (osd, payload) = entry.split_once('=')?;
+            let raw = decode_hex(payload)?;
+            let value: Value = serde_json::from_str(&raw).ok()?;
+            Some(
+                value
+                    .pointer("/ops_in_flight/ops")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|op| InflightOp {
+                        osd: format!("osd.{osd}"),
+                        age_seconds: ptr_f64(op, "/age"),
+                        flag_point: ptr_str(op, "/type_data/flag_point"),
+                        description: ptr_str(op, "/description"),
+                    })
+                    .filter(|op| !op.description.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    parsed.sort_by(|left, right| right.age_seconds.total_cmp(&left.age_seconds));
+    parsed.truncate(8);
+    parsed
+}
+
+fn decode_hex(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -450,5 +508,23 @@ mod tests {
         .expect("a write-limited OSD should parse");
 
         assert_eq!(summary.osd_io_write_limits, "osd.2: /dev/vdb 131072");
+    }
+
+    #[test]
+    fn inflight_ops_decode_oldest_first_with_object_context() {
+        let raw = r#"{"ops_in_flight":{"ops":[{"description":"osd_op(client.1 2.a workshop_object [write 0~4096])","age":12.5,"type_data":{"flag_point":"waiting for subops from 2"}},{"description":"osd_op(client.2 2.b second [read 0~4096])","age":3.0,"type_data":{"flag_point":"queued for pg"}}]}}"#;
+        let hex = raw
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let operations = parse_inflight_ops(&format!("2={hex}"));
+
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].osd, "osd.2");
+        assert_eq!(operations[0].age_seconds, 12.5);
+        assert_eq!(operations[0].flag_point, "waiting for subops from 2");
+        assert!(operations[0].description.contains("workshop_object"));
     }
 }

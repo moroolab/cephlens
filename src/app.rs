@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{ChildStdin, Command as ProcessCommand, Stdio},
@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::{
     collect::{parse_abnormal_pgs, parse_cluster_summary, parse_osds, parse_pools, run_probe},
+    diagnose::{DiagnoseInput, Insight, InsightLevel, diagnose},
     editor::ConfigEditor,
     flow::{FlowMetric, FlowSort},
     kfstrace::{KfsEvent, parse_kfs_event},
@@ -35,7 +36,7 @@ use crate::{
     trace::{
         TRACE_BUCKET_SECS, TraceBucket, TraceEvent, TraceInstallConfig, TraceTarget,
         client_tracer_cleanup_command, kfstrace_run_command_with_session, parse_trace_event,
-        radostrace_run_command_with_session, record_trace_event_at,
+        radostrace_run_command_with_session, record_trace_event_at, trace_graph_rows,
     },
     util::shell_quote,
 };
@@ -46,6 +47,15 @@ pub(crate) const EVENT_LOG_DEFAULT_HEIGHT: u16 = 6;
 // grows. The log is capped at terminal_height - EVENT_LOG_RESERVED_ROWS.
 pub(crate) const EVENT_LOG_RESERVED_ROWS: u16 = 10;
 const SESSION_SNAPSHOT_LIMIT: usize = 10_000;
+const INSIGHT_HISTORY_LIMIT: usize = 400;
+const INSIGHT_HISTORY_SECS: i64 = 15 * 60;
+const INSIGHT_DEDUP_SECS: i64 = 15;
+
+#[derive(Clone, Debug)]
+pub(crate) struct TimedInsight {
+    pub(crate) captured_at: DateTime<Utc>,
+    pub(crate) insight: Insight,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum WorkerMsg {
@@ -170,6 +180,7 @@ pub(crate) struct App {
     pub(crate) nodes_scroll: usize,
     pub(crate) osds_scroll: usize,
     pub(crate) insights_scroll: usize,
+    pub(crate) insight_history: VecDeque<TimedInsight>,
     pub(crate) trace_scroll: usize,
     pub(crate) logs_scroll: usize,
     pub(crate) node_summaries: HashMap<String, NodeSummary>,
@@ -634,6 +645,7 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
         };
         record_session_snapshot(app, &snapshot);
         app.snapshot = Some(snapshot);
+        capture_insight_history(app);
     } else if let Some(host) = id.strip_prefix("node:") {
         let node = parse_node_stream_payload(host, payload)?;
         app.node_summaries.insert(host.to_owned(), node);
@@ -1304,4 +1316,195 @@ fn record_trace_event(app: &mut App, event: &TraceEvent) {
     let now_bucket = Utc::now().timestamp() / TRACE_BUCKET_SECS;
     let retention_secs = app.trace_ttl_secs.max(app.trace_window_secs);
     record_trace_event_at(&mut app.trace_series, event, now_bucket, retention_secs);
+}
+
+pub(crate) fn operator_insights(app: &App) -> Vec<Insight> {
+    let mut current = current_operator_insights(app);
+    let current_text = current
+        .iter()
+        .map(|insight| insight.text.clone())
+        .collect::<HashSet<_>>();
+    let now = Utc::now();
+    current.extend(
+        app.insight_history
+            .iter()
+            .rev()
+            .filter(|entry| {
+                now.signed_duration_since(entry.captured_at).num_seconds() <= INSIGHT_HISTORY_SECS
+                    && !current_text.contains(&entry.insight.text)
+            })
+            .map(|entry| {
+                let mut insight = entry.insight.clone();
+                let age = now
+                    .signed_duration_since(entry.captured_at)
+                    .num_seconds()
+                    .max(0);
+                insight.text = format!("{age}s ago · {}", insight.text);
+                insight
+            }),
+    );
+    current
+}
+
+fn current_operator_insights(app: &App) -> Vec<Insight> {
+    let trace_rows = trace_graph_rows(
+        app.snapshot.as_ref(),
+        &app.trace_events,
+        &app.trace_series,
+        usize::MAX,
+        app.trace_window_secs,
+    );
+    let now = Utc::now().timestamp();
+    let cutoff = now - app.trace_window_secs.max(1) as i64;
+    let trace_events = app
+        .trace_events
+        .iter()
+        .filter(|event| event.observed_at >= cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rados_events = app
+        .radostrace_events
+        .iter()
+        .filter(|event| event.observed_at >= cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
+    let trace_running =
+        app.trace_active > 0 || app.kfstrace_active > 0 || app.radostrace_active > 0;
+    let idle_message = if trace_running {
+        "trace is running with no matching events yet; workload may be idle or below the threshold"
+    } else {
+        "no trace data; press t/f/r to start osd/kfs/rados, a for all"
+    };
+    diagnose(DiagnoseInput {
+        snapshot: app.snapshot.as_ref(),
+        admin_host: &app.admin_host,
+        node_summaries: &app.node_summaries,
+        stream_counts: Some(stream_counts(app)),
+        trace_window_secs: app.trace_window_secs,
+        trace_events: &trace_events,
+        trace_rows: &trace_rows,
+        kfs_events: &app.kfstrace_events,
+        rados_events: &rados_events,
+        idle_message: Some(idle_message),
+    })
+}
+
+fn capture_insight_history(app: &mut App) {
+    let now = Utc::now();
+    let insights = current_operator_insights(app);
+    remember_insights(&mut app.insight_history, now, insights);
+}
+
+fn remember_insights(
+    history: &mut VecDeque<TimedInsight>,
+    now: DateTime<Utc>,
+    insights: impl IntoIterator<Item = Insight>,
+) {
+    while history.front().is_some_and(|entry| {
+        now.signed_duration_since(entry.captured_at).num_seconds() > INSIGHT_HISTORY_SECS
+    }) {
+        history.pop_front();
+    }
+
+    for insight in insights
+        .into_iter()
+        .filter(|insight| insight.level != InsightLevel::Ok)
+        .filter(|insight| !insight.text.starts_with("no trace data"))
+        .filter(|insight| {
+            !insight
+                .text
+                .starts_with("trace is running with no matching")
+        })
+    {
+        let duplicate = history.iter().rev().any(|entry| {
+            now.signed_duration_since(entry.captured_at).num_seconds() <= INSIGHT_DEDUP_SECS
+                && entry.insight.text == insight.text
+        });
+        if !duplicate {
+            history.push_back(TimedInsight {
+                captured_at: now,
+                insight,
+            });
+        }
+    }
+    while history.len() > INSIGHT_HISTORY_LIMIT {
+        history.pop_front();
+    }
+}
+
+fn stream_counts(app: &App) -> (usize, usize) {
+    let total = app.stream_statuses.len();
+    let live = app
+        .stream_statuses
+        .values()
+        .filter(|status| status.state == StreamState::Live)
+        .count();
+    (live, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration as ChronoDuration;
+
+    use super::*;
+
+    fn warning(text: &str) -> Insight {
+        Insight {
+            level: InsightLevel::Warn,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn insight_history_deduplicates_and_expires_old_evidence() {
+        let started = Utc::now();
+        let mut history = VecDeque::new();
+
+        remember_insights(
+            &mut history,
+            started,
+            [
+                warning("replica wait"),
+                warning("replica wait"),
+                Insight {
+                    level: InsightLevel::Ok,
+                    text: "healthy".to_owned(),
+                },
+            ],
+        );
+        assert_eq!(history.len(), 1);
+
+        remember_insights(
+            &mut history,
+            started + ChronoDuration::seconds(16),
+            [warning("replica wait")],
+        );
+        assert_eq!(
+            history.len(),
+            2,
+            "evidence can recur after the dedup window"
+        );
+
+        remember_insights(
+            &mut history,
+            started + ChronoDuration::seconds(920),
+            [warning("current warning")],
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].insight.text, "current warning");
+    }
+
+    #[test]
+    fn insight_history_caps_the_scrollback() {
+        let mut history = VecDeque::new();
+        let now = Utc::now();
+        remember_insights(
+            &mut history,
+            now,
+            (0..INSIGHT_HISTORY_LIMIT + 10).map(|index| warning(&format!("warning {index}"))),
+        );
+
+        assert_eq!(history.len(), INSIGHT_HISTORY_LIMIT);
+        assert_eq!(history.front().unwrap().insight.text, "warning 10");
+    }
 }

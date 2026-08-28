@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{self, Stdout},
     path::PathBuf,
@@ -395,6 +395,7 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
         nodes_scroll: 0,
         osds_scroll: 0,
         insights_scroll: 0,
+        insight_history: VecDeque::new(),
         trace_scroll: 0,
         logs_scroll: 0,
         node_summaries: HashMap::new(),
@@ -487,6 +488,7 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         nodes_scroll: 0,
         osds_scroll: 0,
         insights_scroll: 0,
+        insight_history: VecDeque::new(),
         trace_scroll: 0,
         logs_scroll: 0,
         node_summaries: HashMap::new(),

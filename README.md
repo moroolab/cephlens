@@ -53,19 +53,23 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
   pool replica/failure-domain evidence, and capacity thresholds over a single
   SSH stream.
 - Per-node readiness: connection state, OSD ids, CPU and memory percent, IO stall
-  share from `/proc/pressure/io`, OSD service block-write limits, and Ceph
-  version/deployment.
+  share from `/proc/pressure/io`, OSD service block-write limits, limited-OSD
+  in-flight operations, and Ceph version/deployment.
 - Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
   numbers, and health check names and first details read straight out of
   `ceph -s`.
-- osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
-- Queue and receive latency are shown together in compact and wide trace tables.
-  Once either value exceeds 10ms and doubles the other, Insights names the
-  likely OSD-processing or network-delay fault class.
+- osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue,
+  receive, replica-peer wait, BlueStore, and KV-commit latency. Insights compare
+  the primary's slow peer with that peer OSD's queue/receive evidence to
+  distinguish replica processing from the replica response network path.
 - A flow view that renders each observed op as an OSD -> placement group ->
-  object path. radostrace supplies the complete path; with only osdtrace, the
-  path stops at the placement group. Each row carries op count, latency, and
-  mean op size; a read reports the length it requested, not the bytes returned.
+  object path. osdtrace keeps primary and replica OSD/PG branches visible while
+  radostrace adds object names to matching primary branches. Each row carries
+  op count, latency, and mean op size; a read reports the length it requested,
+  not the bytes returned.
+- Insights keep up to 400 non-OK observations from the last 15 minutes. This
+  preserves short recovery, scrub, peer-wait, and in-flight slow-op evidence
+  after the live symptom disappears.
 - No standing agent: no permanent daemon on the nodes; the osdtrace runner script removes itself on stop, quit, or TTL expiry. (The cephtrace tracer binaries you deploy do persist under `~/.cephlens/bin/`.)
 - Edit hosts and trace settings live in the TUI; changes apply to open SSH streams immediately.
 - Export recorded sessions as Markdown reports with the same diagnostic rules used by the TUI.
@@ -238,6 +242,9 @@ admin host:
   sudo -n ceph pg dump pgs --format json
   sudo -n rados --version
 
+OSD hosts with a detected systemd block-write limit:
+  sudo -n ceph daemon osd.<id> dump_ops_in_flight
+
 bench command:
   sudo -n ceph osd pool create cephlens-test-<session>-<pid> 32
   sudo -n ceph osd pool application enable cephlens-test-<session>-<pid> rados
@@ -334,7 +341,12 @@ Esc/c    return to live dashboard
 Config edits are written to `cephlens.toml` and applied to the live SSH streams
 immediately after the edit is confirmed.
 
-The integrated trace panel can show osdtrace, kfstrace, or radostrace data. The osdtrace view observes Ceph OSD nodes. It streams `op_r`, `op_w`, and `subop_w` lines into the live dashboard and summarizes total, queue, and BlueStore latency. The kfstrace and radostrace views run on `client_hosts`. The kfstrace view uses MDS mode and shows CephFS metadata operations.
+The integrated trace panel can show osdtrace, kfstrace, or radostrace data. The
+osdtrace view observes Ceph OSD nodes. It streams `op_r`, `op_w`, and `subop_w`
+lines into the live dashboard and summarizes total, queue, receive, replica-peer
+wait, and BlueStore latency. The kfstrace and radostrace views run on
+`client_hosts`. The kfstrace view uses MDS mode and shows CephFS metadata
+operations.
 `trace_window_secs` controls the recent osdtrace aggregation window in both the
 live TUI and generated reports.
 The TUI requires a terminal of at least 100 columns by 32 rows. A 142 by 32
@@ -355,7 +367,12 @@ table shows connection state (`live`, `dial`, `retry`, `error`), OSD ids, CPU
 percentage, and memory percentage. The TUI redraws after input or new stream
 data instead of on every event poll. The insights panel starts taller than
 before and, like the overview, trace, and event-log panels, can be focused with
-`Tab` and resized with `+` or `-`.
+`Tab` and resized with `+` or `-`. It retains up to 400 non-OK observations for
+15 minutes; focus it and use `j`/`k`, arrow keys, Page Up/Down, or Home/End to
+review evidence that has disappeared from the current cluster snapshot.
+When an OSD block-write limit is present, the five-second OSD scan also reads a
+bounded `dump_ops_in_flight` response from that local OSD so Insights can name
+the oldest pending operation, wait point, PG, and object where available.
 When `trace_auto_start` is true, cephlens starts osdtrace runners as soon as the
 TUI opens. The default config keeps it false so an operator explicitly starts
 and stops tracing with `t`, `f`, `r`, or `a`.
