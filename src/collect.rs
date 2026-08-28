@@ -10,7 +10,7 @@ use crate::{
         ClusterSummary, HealthCheck, NodeSummary, OsdSummary, PgSummary, PoolSummary, Snapshot,
     },
     ssh::ssh_capture,
-    stream::node_facts_snippet,
+    stream::{node_facts_snippet, parse_inflight_ops},
     util::{MAX_PARALLEL_HOSTS, map_parallel, ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
 };
 
@@ -352,6 +352,7 @@ printf 'deployment=%s\n' "$deployment"
 printf 'ceph_osd_processes=%s\n' "$count"
 printf 'osd_ids=%s\n' "$ids"
 printf 'osd_io_write_limits=%s\n' "$io_limits"
+printf 'osd_inflight_hex=%s\n' "$inflight_hex"
 printf 'cpu_percent=%s\n' "$cpu_pct"
 printf 'mem_percent=%s\n' "$mem_pct"
 printf 'io_stall_percent=%s\n' "$io_stall"
@@ -374,6 +375,11 @@ printf 'cpu_stall_percent=%s\n' "$cpu_stall"
                     .unwrap_or_default(),
                 osd_ids: map.get("osd_ids").cloned().unwrap_or_default(),
                 osd_io_write_limits: map.get("osd_io_write_limits").cloned().unwrap_or_default(),
+                osd_inflight_ops: parse_inflight_ops(
+                    map.get("osd_inflight_hex")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ),
                 cpu_percent: map
                     .get("cpu_percent")
                     .and_then(|s| s.parse().ok())

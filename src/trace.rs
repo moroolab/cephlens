@@ -26,6 +26,7 @@ pub(crate) struct TraceTarget {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TraceEvent {
+    pub(crate) observed_at: i64,
     pub(crate) host: String,
     pub(crate) osd: String,
     pub(crate) pg: String,
@@ -40,7 +41,14 @@ pub(crate) struct TraceEvent {
     pub(crate) queue_lat_us: u64,
     pub(crate) bluestore_lat_us: u64,
     pub(crate) kv_commit_us: u64,
+    pub(crate) peers: Vec<TracePeer>,
     pub(crate) raw: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TracePeer {
+    pub(crate) osd: i64,
+    pub(crate) latency_us: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -62,6 +70,8 @@ pub(crate) struct TraceBucket {
     pub(crate) queue_max_us: u64,
     pub(crate) store_max_us: u64,
     pub(crate) kv_commit_max_us: u64,
+    pub(crate) peer_max_us: u64,
+    pub(crate) slow_peer: String,
     pub(crate) pgs: HashMap<String, TracePgStats>,
 }
 
@@ -78,6 +88,8 @@ pub(crate) struct TraceGraphRow {
     pub(crate) queue_max_us: u64,
     pub(crate) store_max_us: u64,
     pub(crate) kv_commit_max_us: u64,
+    pub(crate) peer_max_us: u64,
+    pub(crate) slow_peer: String,
     pub(crate) pg_count: usize,
     pub(crate) hot_pg: String,
     pub(crate) points: Vec<u64>,
@@ -458,6 +470,10 @@ fn summarize_traceable(values: &[String]) -> String {
 }
 
 pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
+    parse_trace_event_at(host, line, Utc::now().timestamp())
+}
+
+pub(crate) fn parse_trace_event_at(host: &str, line: &str, observed_at: i64) -> Option<TraceEvent> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -471,6 +487,7 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
     }
     if let Some(error) = trimmed.strip_prefix("__CEPHLENS_TRACE_ERROR__") {
         return Some(TraceEvent {
+            observed_at,
             host: host.to_owned(),
             osd: "-".to_owned(),
             pg: "-".to_owned(),
@@ -482,6 +499,7 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
             queue_lat_us: 0,
             bluestore_lat_us: 0,
             kv_commit_us: 0,
+            peers: Vec::new(),
             size_bytes: 0,
             raw: error.trim().to_owned(),
         });
@@ -492,6 +510,7 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
     let osd = token_after(trimmed, "osd").unwrap_or("-").to_owned();
     let pg = token_after(trimmed, "pg").unwrap_or("-").to_owned();
     Some(TraceEvent {
+        observed_at,
         host: host.to_owned(),
         osd,
         pg,
@@ -521,8 +540,32 @@ pub(crate) fn parse_trace_event(host: &str, line: &str) -> Option<TraceEvent> {
         kv_commit_us: token_after(trimmed, "kv_commit")
             .and_then(|value| value.parse().ok())
             .unwrap_or_default(),
+        peers: parse_trace_peers(trimmed),
         raw: trimmed.to_owned(),
     })
+}
+
+fn parse_trace_peers(line: &str) -> Vec<TracePeer> {
+    let Some((_, tail)) = line.split_once("peers [") else {
+        return Vec::new();
+    };
+    let Some((peers, _)) = tail.split_once(']') else {
+        return Vec::new();
+    };
+    peers
+        .split("),")
+        .filter_map(|entry| {
+            let (osd, latency) = entry
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split_once(',')?;
+            Some(TracePeer {
+                osd: osd.trim().parse().ok()?,
+                latency_us: latency.trim().parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 fn token_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -559,6 +602,11 @@ pub(crate) fn normalize_pg_name(pg: &str) -> String {
 
 pub(crate) fn dominant_component(row: &TraceGraphRow) -> TraceComponent {
     [
+        TraceComponent {
+            name: "peer",
+            value_us: row.peer_max_us,
+            suspect: "replica OSD processing or the replica response path",
+        },
         TraceComponent {
             name: "kv_commit",
             value_us: row.kv_commit_max_us,
@@ -655,6 +703,8 @@ pub(crate) fn trace_graph_rows_at(
             let mut queue_max_us = 0u64;
             let mut store_max_us = 0u64;
             let mut kv_commit_max_us = 0u64;
+            let mut peer_max_us = 0u64;
+            let mut slow_peer = String::new();
             let mut pg_stats = HashMap::<String, TracePgStats>::new();
 
             if let Some(series) = series {
@@ -671,6 +721,10 @@ pub(crate) fn trace_graph_rows_at(
                     queue_max_us = queue_max_us.max(bucket.queue_max_us);
                     store_max_us = store_max_us.max(bucket.store_max_us);
                     kv_commit_max_us = kv_commit_max_us.max(bucket.kv_commit_max_us);
+                    if bucket.peer_max_us > peer_max_us {
+                        peer_max_us = bucket.peer_max_us;
+                        slow_peer.clone_from(&bucket.slow_peer);
+                    }
                     for (pg, stats) in &bucket.pgs {
                         let aggregate = pg_stats.entry(pg.clone()).or_default();
                         aggregate.ops = aggregate.ops.saturating_add(stats.ops);
@@ -694,6 +748,8 @@ pub(crate) fn trace_graph_rows_at(
                 queue_max_us,
                 store_max_us,
                 kv_commit_max_us,
+                peer_max_us,
+                slow_peer,
                 pg_count,
                 hot_pg,
                 points: trace_points(series, first_bucket, now_bucket),
@@ -752,6 +808,12 @@ pub(crate) fn record_trace_event_at(
         bucket.queue_max_us = bucket.queue_max_us.max(event.queue_lat_us);
         bucket.store_max_us = bucket.store_max_us.max(event.bluestore_lat_us);
         bucket.kv_commit_max_us = bucket.kv_commit_max_us.max(event.kv_commit_us);
+        if let Some(peer) = event.peers.iter().max_by_key(|peer| peer.latency_us)
+            && peer.latency_us > bucket.peer_max_us
+        {
+            bucket.peer_max_us = peer.latency_us;
+            bucket.slow_peer = normalize_osd_name(&peer.osd.to_string());
+        }
         let pg = normalize_pg_name(&event.pg);
         if pg != "-" {
             let pg_stats = bucket.pgs.entry(pg).or_default();
@@ -855,7 +917,7 @@ mod tests {
     fn parse_trace_event_reads_osdtrace_fields() {
         let event = parse_trace_event(
             "node-a",
-            "123 op_w osd 2 pg 2.e throttle_lat 7 recv_lat 11 dispatch_lat 13 queue_lat 17 bluestore_lat 19 kv_commit 23 op_lat 101",
+            "123 op_w osd 2 pg 2.e throttle_lat 7 recv_lat 11 dispatch_lat 13 queue_lat 17 bluestore_lat 19 kv_commit 23 peers [(3, 47000), (4, 1200)] op_lat 101",
         )
         .expect("trace event should parse");
 
@@ -870,6 +932,19 @@ mod tests {
         assert_eq!(event.queue_lat_us, 17);
         assert_eq!(event.bluestore_lat_us, 19);
         assert_eq!(event.kv_commit_us, 23);
+        assert_eq!(
+            event.peers,
+            vec![
+                TracePeer {
+                    osd: 3,
+                    latency_us: 47_000,
+                },
+                TracePeer {
+                    osd: 4,
+                    latency_us: 1_200,
+                }
+            ]
+        );
         assert_eq!(event.size_bytes, 0, "this build emits no size column");
     }
 
@@ -910,6 +985,23 @@ mod tests {
         assert!(parse_trace_event("node-a", "").is_none());
         assert!(parse_trace_event("node-a", "PID something").is_none());
         assert!(parse_trace_event("node-a", "Ceph Version 18.2.0").is_none());
+    }
+
+    #[test]
+    fn peer_wait_is_retained_in_the_trace_window() {
+        let now_bucket = Utc::now().timestamp() / TRACE_BUCKET_SECS;
+        let mut series = HashMap::new();
+        let event = parse_trace_event(
+            "node-a",
+            "op_w osd 1 pg 2.a peers [(2, 50000), (3, 4000)] op_lat 55000",
+        )
+        .expect("peer trace parses");
+
+        record_trace_event_at(&mut series, &event, now_bucket, 60);
+        let rows = trace_graph_rows_at(None, &[], &series, usize::MAX, now_bucket, 10);
+
+        assert_eq!(rows[0].peer_max_us, 50_000);
+        assert_eq!(rows[0].slow_peer, "osd.2");
     }
 
     #[test]
