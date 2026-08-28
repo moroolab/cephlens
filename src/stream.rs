@@ -21,21 +21,30 @@ cleanup() { rm -rf "$dir"; }
 trap 'cleanup; exit 0' INT TERM HUP PIPE
 trap cleanup EXIT"#;
 
-// Prime every cache before the first payload. Steady-state refreshes keep
-// `ceph -s` fast and rotate the three detail queries below.
+// Prime every cache before the first payload. Steady-state refreshes keep the
+// changing PG and OSD-map evidence current and rotate the heavier detail queries.
 pub(crate) const CLUSTER_STREAM_TICK: &str = r#"  sudo -n ceph -s --format json >"$dir/status" 2>/dev/null &
   sudo -n ceph osd tree --format json >"$dir/tree" 2>/dev/null &
   sudo -n ceph osd df --format json >"$dir/df" 2>/dev/null &
   sudo -n ceph osd perf --format json >"$dir/perf" 2>/dev/null &
+  sudo -n ceph osd dump --format json >"$dir/osdmap" 2>/dev/null &
+  sudo -n ceph osd crush rule dump --format json >"$dir/crush" 2>/dev/null &
+  sudo -n ceph pg dump pgs --format json >"$dir/pgs" 2>/dev/null &
   wait"#;
 
 const CLUSTER_STREAM_EMIT: &str = r#"  status=$(tr -d '\n' <"$dir/status")
   tree=$(tr -d '\n' <"$dir/tree")
   df=$(tr -d '\n' <"$dir/df")
   perf=$(tr -d '\n' <"$dir/perf")
+  osdmap=$(tr -d '\n' <"$dir/osdmap")
+  crush=$(tr -d '\n' <"$dir/crush")
+  pgs=$(tr -d '\n' <"$dir/pgs")
   [ -n "$perf" ] || perf=null
+  [ -n "$osdmap" ] || osdmap=null
+  [ -n "$crush" ] || crush=null
+  [ -n "$pgs" ] || pgs=null
   if [ -n "$status" ] && [ -n "$tree" ] && [ -n "$df" ]; then
-    printf '{"type":"status","status":%s,"tree":%s,"df":%s,"perf":%s}\n' "$status" "$tree" "$df" "$perf"
+    printf '{"type":"status","status":%s,"tree":%s,"df":%s,"perf":%s,"osdmap":%s,"crush":%s,"pgs":%s}\n' "$status" "$tree" "$df" "$perf" "$osdmap" "$crush" "$pgs"
   else
     printf '{"type":"error","message":"ceph command failed"}\n'
   fi"#;
@@ -43,13 +52,16 @@ const CLUSTER_STREAM_EMIT: &str = r#"  status=$(tr -d '\n' <"$dir/status")
 fn cluster_stream_refresh_tick() -> String {
     format!(
         r#"  (sudo -n ceph -s --format json >"$dir/status.next" 2>/dev/null && mv "$dir/status.next" "$dir/status" || : >"$dir/status") &
+  (sudo -n ceph osd dump --format json >"$dir/osdmap.next" 2>/dev/null && mv "$dir/osdmap.next" "$dir/osdmap" || : >"$dir/osdmap") &
+  (sudo -n ceph pg dump pgs --format json >"$dir/pgs.next" 2>/dev/null && mv "$dir/pgs.next" "$dir/pgs" || : >"$dir/pgs") &
   case "$phase" in
     0) (sudo -n ceph osd tree --format json >"$dir/tree.next" 2>/dev/null && mv "$dir/tree.next" "$dir/tree" || : >"$dir/tree") ;;
     1) (sudo -n ceph osd df --format json >"$dir/df.next" 2>/dev/null && mv "$dir/df.next" "$dir/df" || : >"$dir/df") ;;
     2) (sudo -n ceph osd perf --format json >"$dir/perf.next" 2>/dev/null && mv "$dir/perf.next" "$dir/perf" || : >"$dir/perf") ;;
+    3) (sudo -n ceph osd crush rule dump --format json >"$dir/crush.next" 2>/dev/null && mv "$dir/crush.next" "$dir/crush" || : >"$dir/crush") ;;
   esac &
   wait
-  phase=$(( (phase + 1) % 3 ))
+  phase=$(( (phase + 1) % 4 ))
 {emit}"#,
         emit = CLUSTER_STREAM_EMIT,
     )
@@ -93,7 +105,25 @@ pub(crate) const NODE_OSD_FACTS_SNIPPET: &str = r#"# pgrep -c prints 0 and exits
 # append a second line and break the JSON payload below.
 count=$(pgrep -c '[c]eph-osd' 2>/dev/null || true)
 count=${count:-0}
-ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id \([0-9][0-9]*\).*/\1/p' | paste -sd, -)"#;
+ids=$(pgrep -af '[c]eph-osd --cluster ceph' 2>/dev/null | sed -n 's/.*--id[ =]\([0-9][0-9]*\).*/\1/p' | paste -sd, -)
+io_limits=""
+for pid in $(pgrep -x ceph-osd 2>/dev/null || true); do
+  args=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  osd_id=$(printf '%s\n' "$args" | sed -n 's/.*--id[ =]\([0-9][0-9]*\).*/\1/p')
+  cgroup=$(awk -F: '$1 == "0" {print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null)
+  unit=${cgroup##*/}
+  case "$unit" in
+    *.service)
+      limit=$(systemctl show "$unit" --property=IOWriteBandwidthMax --value 2>/dev/null |
+        tr '\n' ',' | sed 's/,$//')
+      ;;
+    *) limit="" ;;
+  esac
+  if [ -n "$osd_id" ] && [ -n "$limit" ]; then
+    if [ -n "$io_limits" ]; then io_limits="$io_limits; "; fi
+    io_limits="${io_limits}osd.${osd_id}: ${limit}"
+  fi
+done"#;
 
 pub(crate) const NODE_DYNAMIC_FACTS_SNIPPET: &str = r#"pressure_files=""
 [ -r /proc/pressure/io ] && pressure_files="$pressure_files /proc/pressure/io"
@@ -147,7 +177,7 @@ while true; do
   fi
   prev_total=$total
   prev_idle=$idle_all
-  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
+  printf '{{"type":"node","hostname":"%s","sudo":"%s","ceph_version":"%s","deployment":"%s","ceph_osd_processes":%s,"osd_ids":"%s","osd_io_write_limits":"%s","cpu_percent":%s,"mem_percent":%s,"io_stall_percent":%s,"cpu_stall_percent":%s}}\n' "$hostname" "$sudo_state" "$ceph_version" "$deployment" "$count" "$ids" "$io_limits" "$cpu_pct" "$mem_pct" "$io_stall" "$cpu_stall"
   sleep {interval_secs}
   osd_ticks=$((osd_ticks + 1))
   if [ "$osd_ticks" -ge {osd_refresh_ticks} ]; then
@@ -182,6 +212,7 @@ pub(crate) fn parse_node_stream_payload(host: &str, payload: &str) -> Result<Nod
         deployment: ptr_str(&value, "/deployment"),
         ceph_osd_processes: ptr_u64(&value, "/ceph_osd_processes"),
         osd_ids: ptr_str(&value, "/osd_ids"),
+        osd_io_write_limits: ptr_str(&value, "/osd_io_write_limits"),
         cpu_percent: ptr_f64(&value, "/cpu_percent"),
         mem_percent: ptr_f64(&value, "/mem_percent"),
         io_stall_percent: ptr_f64(&value, "/io_stall_percent"),
@@ -250,7 +281,7 @@ mod tests {
         (root, bin)
     }
 
-    // A sequential tick costs four stubbed sleeps and a concurrent one costs a
+    // A sequential tick costs seven stubbed sleeps and a concurrent one costs a
     // single sleep. The bound sits between them with room on both sides so
     // ordinary scheduling noise cannot flip the result.
     #[cfg(target_os = "linux")]
@@ -282,11 +313,14 @@ mod tests {
         assert!(value.pointer("/status").is_some());
         assert!(value.pointer("/tree").is_some());
         assert!(value.pointer("/df").is_some());
+        assert!(value.pointer("/osdmap").is_some());
+        assert!(value.pointer("/crush").is_some());
+        assert!(value.pointer("/pgs").is_some());
         assert!(
             elapsed < QUERY_SECS * 2.0,
-            "tick took {elapsed:.2}s; four concurrent {QUERY_SECS}s queries should not approach \
+            "tick took {elapsed:.2}s; seven concurrent {QUERY_SECS}s queries should not approach \
              the {:.2}s sequential cost",
-            QUERY_SECS * 4.0
+            QUERY_SECS * 7.0
         );
     }
 
@@ -295,11 +329,14 @@ mod tests {
         let script = cluster_stream_command(1);
 
         assert!(script.contains("case \"$phase\" in"));
-        assert!(script.contains("phase=$(( (phase + 1) % 3 ))"));
+        assert!(script.contains("phase=$(( (phase + 1) % 4 ))"));
         assert!(script.contains("|| : >\"$dir/status\""));
         assert!(script.contains("|| : >\"$dir/tree\""));
         assert!(script.contains("|| : >\"$dir/df\""));
         assert!(script.contains("|| : >\"$dir/perf\""));
+        assert!(script.contains("|| : >\"$dir/osdmap\""));
+        assert!(script.contains("|| : >\"$dir/crush\""));
+        assert!(script.contains("|| : >\"$dir/pgs\""));
         assert_eq!(script.matches("sudo -n ceph -s --format json").count(), 2);
         assert_eq!(
             script
@@ -314,6 +351,24 @@ mod tests {
         assert_eq!(
             script
                 .matches("sudo -n ceph osd perf --format json")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("sudo -n ceph osd dump --format json")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("sudo -n ceph osd crush rule dump --format json")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script
+                .matches("sudo -n ceph pg dump pgs --format json")
                 .count(),
             2
         );
@@ -378,11 +433,22 @@ mod tests {
     fn node_stream_payload_parses_a_host_without_osds() {
         let summary = parse_node_stream_payload(
             "ceph-admin",
-            r#"{"type":"node","hostname":"ceph-admin","sudo":"ok","ceph_version":"ceph version 19.2.0","deployment":"cephadm","ceph_osd_processes":0,"osd_ids":"","cpu_percent":1.5,"mem_percent":42.0}"#,
+            r#"{"type":"node","hostname":"ceph-admin","sudo":"ok","ceph_version":"ceph version 19.2.0","deployment":"cephadm","ceph_osd_processes":0,"osd_ids":"","osd_io_write_limits":"","cpu_percent":1.5,"mem_percent":42.0}"#,
         )
         .expect("a mon-only node should parse");
 
         assert_eq!(summary.ceph_osd_processes, 0);
         assert_eq!(summary.osd_ids, "");
+    }
+
+    #[test]
+    fn node_stream_payload_keeps_osd_block_write_limit_evidence() {
+        let summary = parse_node_stream_payload(
+            "node-b",
+            r#"{"type":"node","hostname":"node-b","sudo":"ok","ceph_osd_processes":1,"osd_ids":"2","osd_io_write_limits":"osd.2: /dev/vdb 131072","cpu_percent":1.5,"mem_percent":42.0}"#,
+        )
+        .expect("a write-limited OSD should parse");
+
+        assert_eq!(summary.osd_io_write_limits, "osd.2: /dev/vdb 131072");
     }
 }

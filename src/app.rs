@@ -17,7 +17,7 @@ use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
 
 use crate::{
-    collect::{parse_cluster_summary, parse_osds, run_probe},
+    collect::{parse_abnormal_pgs, parse_cluster_summary, parse_osds, parse_pools, run_probe},
     editor::ConfigEditor,
     flow::{FlowMetric, FlowSort},
     kfstrace::{KfsEvent, parse_kfs_event},
@@ -114,6 +114,7 @@ pub(crate) enum Mode {
 pub(crate) enum PanelFocus {
     Nodes,
     Osds,
+    Insights,
     Trace,
     Logs,
 }
@@ -163,10 +164,12 @@ pub(crate) struct App {
     pub(crate) event_log_height: u16,
     pub(crate) terminal_height: u16,
     pub(crate) overview_offset: i16,
+    pub(crate) insights_offset: i16,
     pub(crate) show_help: bool,
     pub(crate) focused_panel: PanelFocus,
     pub(crate) nodes_scroll: usize,
     pub(crate) osds_scroll: usize,
+    pub(crate) insights_scroll: usize,
     pub(crate) trace_scroll: usize,
     pub(crate) logs_scroll: usize,
     pub(crate) node_summaries: HashMap<String, NodeSummary>,
@@ -614,15 +617,20 @@ fn handle_stream_payload(app: &mut App, id: &str, payload: &str) -> Result<()> {
             .pointer("/df")
             .ok_or_else(|| anyhow!("cluster stream missing df"))?;
         let perf = value.pointer("/perf").filter(|perf| !perf.is_null());
+        let osdmap = value.pointer("/osdmap").filter(|map| !map.is_null());
+        let crush = value.pointer("/crush").filter(|rules| !rules.is_null());
+        let pgs = value.pointer("/pgs").filter(|details| !details.is_null());
         let snapshot = Snapshot {
             captured_at: Utc::now(),
             profile: app.profile.clone(),
             admin_host: app.admin_host.clone(),
             hosts: app.hosts.clone(),
             trace_window_secs: app.trace_window_secs,
-            cluster: parse_cluster_summary(status),
+            cluster: parse_cluster_summary(status, osdmap),
             nodes: ordered_nodes(app),
             osds: parse_osds(tree, df, perf),
+            pools: parse_pools(osdmap, crush, tree),
+            abnormal_pgs: parse_abnormal_pgs(pgs),
         };
         record_session_snapshot(app, &snapshot);
         app.snapshot = Some(snapshot);

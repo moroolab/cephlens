@@ -6,6 +6,21 @@ Notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Added pool replica/failure-domain evidence, abnormal PG up/acting mappings,
+  recovery rate, capacity thresholds, HEALTH details, and OSD service block
+  write limits to live diagnosis and session reports.
+- Added a direct queue-versus-receive latency clue for distinguishing a slow
+  OSD from a slow network, with both values retained in compact trace tables.
+
+### Changed
+
+- The insights panel is taller by default and can be focused, scrolled, and
+  resized with the existing panel keys.
+- The compact OSD map prioritizes the complete Host value over secondary
+  columns when horizontal space is limited.
+
 ## [0.1.9] - 2026-07-26
 
 ### Changed

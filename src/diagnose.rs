@@ -61,7 +61,9 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
                 },
             });
         }
-        if !snapshot.cluster.pg_states.contains("active+clean") {
+        insights.extend(cluster_evidence_insights(snapshot));
+        if snapshot.abnormal_pgs.is_empty() && !snapshot.cluster.pg_states.contains("active+clean")
+        {
             insights.push(Insight {
                 level: InsightLevel::Warn,
                 text: format!(
@@ -88,6 +90,8 @@ pub(crate) fn diagnose(input: DiagnoseInput<'_>) -> Vec<Insight> {
             ),
         });
     }
+
+    insights.extend(io_limit_insights(input.node_summaries));
 
     if let Some(error) = input
         .trace_events
@@ -141,13 +145,142 @@ fn health_check_summary(checks: &[HealthCheck]) -> String {
     let mut summary = checks
         .iter()
         .take(SHOWN)
-        .map(|check| format!("{} {}", check.code, short(&check.message, 60)))
+        .map(|check| {
+            let detail = check
+                .details
+                .first()
+                .map(|detail| format!("; {}", short(detail, 48)))
+                .unwrap_or_default();
+            format!("{} {}{detail}", check.code, short(&check.message, 60))
+        })
         .collect::<Vec<_>>()
         .join("; ");
     if checks.len() > SHOWN {
         summary.push_str(&format!(" (+{} more)", checks.len() - SHOWN));
     }
     summary
+}
+
+fn cluster_evidence_insights(snapshot: &Snapshot) -> Vec<Insight> {
+    let mut insights = Vec::new();
+
+    for pool in snapshot.pools.iter().filter(|pool| {
+        pool.available_domains > 0
+            && !pool.failure_domain.is_empty()
+            && pool.size > pool.available_domains
+    }) {
+        insights.push(Insight {
+            level: InsightLevel::Bad,
+            text: format!(
+                "pool {} size {} exceeds {} available {} domains (rule {})",
+                pool.name, pool.size, pool.available_domains, pool.failure_domain, pool.crush_rule
+            ),
+        });
+    }
+
+    if snapshot.cluster.full_ratio > 0.0
+        && let Some(osd) = snapshot
+            .osds
+            .iter()
+            .max_by(|left, right| left.utilization.total_cmp(&right.utilization))
+        && osd.utilization / 100.0 >= snapshot.cluster.full_ratio
+    {
+        insights.push(Insight {
+            level: InsightLevel::Bad,
+            text: format!(
+                "{} utilization {:.3}% crosses full threshold {:.3}% (near {:.3}%, backfill {:.3}%)",
+                osd.name,
+                osd.utilization,
+                snapshot.cluster.full_ratio * 100.0,
+                snapshot.cluster.nearfull_ratio * 100.0,
+                snapshot.cluster.backfillfull_ratio * 100.0
+            ),
+        });
+    }
+
+    if let Some(pg) = snapshot
+        .abnormal_pgs
+        .iter()
+        .find(|pg| pg.state.contains("scrubbing+deep"))
+        .or_else(|| {
+            snapshot
+                .abnormal_pgs
+                .iter()
+                .find(|pg| pg.state.contains("backfill") || pg.state.contains("recover"))
+        })
+        .or_else(|| snapshot.abnormal_pgs.first())
+    {
+        let more = snapshot.abnormal_pgs.len().saturating_sub(1);
+        let suffix = if more > 0 {
+            format!("; +{more} more")
+        } else {
+            String::new()
+        };
+        insights.push(Insight {
+            level: InsightLevel::Warn,
+            text: format!(
+                "PG {} {} · up {} · acting {}{}",
+                pg.id,
+                pg.state,
+                format_osd_set(&pg.up),
+                format_osd_set(&pg.acting),
+                suffix
+            ),
+        });
+    }
+
+    if snapshot.cluster.recovering_bytes_sec > 0 {
+        insights.push(Insight {
+            level: InsightLevel::Warn,
+            text: format!(
+                "recovery/backfill moving {}/s while client operations are observed",
+                format_bytes(snapshot.cluster.recovering_bytes_sec)
+            ),
+        });
+    }
+
+    insights
+}
+
+fn io_limit_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<Insight> {
+    let mut limited = node_summaries
+        .values()
+        .filter(|node| !node.osd_io_write_limits.is_empty())
+        .collect::<Vec<_>>();
+    limited.sort_by(|left, right| left.host.cmp(&right.host));
+    limited
+        .into_iter()
+        .map(|node| Insight {
+            level: InsightLevel::Bad,
+            text: format!(
+                "{} OSD block write limit: {}",
+                node.host,
+                short(&node.osd_io_write_limits, 72)
+            ),
+        })
+        .collect()
+}
+
+fn format_osd_set(osds: &[i64]) -> String {
+    format!(
+        "[{}]",
+        osds.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn node_pressure_insights(node_summaries: &HashMap<String, NodeSummary>) -> Vec<Insight> {
@@ -206,6 +339,20 @@ fn osd_trace_insights(
             format_latency_us(worst.avg_us)
         ),
     });
+
+    if worst.queue_max_us > 0 || worst.recv_max_us > 0 {
+        insights.push(Insight {
+            level: insight_level_for_latency(worst.queue_max_us.max(worst.recv_max_us)),
+            text: format!(
+                "compare {} / {}: queue {} · recv {} → {}",
+                worst.osd,
+                worst.host,
+                format_latency_us(worst.queue_max_us),
+                format_latency_us(worst.recv_max_us),
+                queue_recv_verdict(worst.queue_max_us, worst.recv_max_us)
+            ),
+        });
+    }
 
     let dominant = dominant_component(worst);
     if dominant.value_us > 0 {
@@ -277,6 +424,17 @@ fn osd_trace_insights(
     }
 
     insights
+}
+
+fn queue_recv_verdict(queue_us: u64, recv_us: u64) -> &'static str {
+    const CLEAR_DELAY_US: u64 = 10_000;
+    if queue_us >= CLEAR_DELAY_US && queue_us >= recv_us.saturating_mul(2) {
+        "queue is at least 2x recv; OSD queue delay likely"
+    } else if recv_us >= CLEAR_DELAY_US && recv_us >= queue_us.saturating_mul(2) {
+        "recv is at least 2x queue; network receive delay likely"
+    } else {
+        "no clear queue/recv lead"
+    }
 }
 
 fn kfs_insights(events: &[KfsEvent]) -> Vec<Insight> {
@@ -388,7 +546,29 @@ fn node_for_host<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::radostrace::parse_rados_event;
+    use crate::{
+        model::{ClusterSummary, OsdSummary, PgSummary, PoolSummary},
+        radostrace::parse_rados_event,
+    };
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            captured_at: chrono::Utc::now(),
+            profile: "test".to_owned(),
+            admin_host: "admin".to_owned(),
+            hosts: vec!["node-a".to_owned()],
+            trace_window_secs: 10,
+            cluster: ClusterSummary {
+                health: "HEALTH_OK".to_owned(),
+                pg_states: "1 active+clean".to_owned(),
+                ..ClusterSummary::default()
+            },
+            nodes: Vec::new(),
+            osds: Vec::new(),
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
+        }
+    }
 
     fn row(osd: &str, host: &str, max_us: u64, queue_us: u64) -> TraceGraphRow {
         TraceGraphRow {
@@ -440,6 +620,11 @@ mod tests {
                 .text
                 .contains("largest observed component queue 20.0ms")
         }));
+        assert!(insights.iter().any(|insight| {
+            insight
+                .text
+                .contains("queue is at least 2x recv; OSD queue delay likely")
+        }));
         assert!(
             insights
                 .iter()
@@ -465,5 +650,103 @@ mod tests {
         assert_eq!(insight.level, InsightLevel::Info);
         assert!(insight.text.contains("not time/PG correlated"));
         assert!(!insight.text.contains("gap ="));
+    }
+
+    #[test]
+    fn queue_and_receive_comparison_names_the_workshop_fault_class() {
+        assert_eq!(
+            queue_recv_verdict(50_000, 100),
+            "queue is at least 2x recv; OSD queue delay likely"
+        );
+        assert_eq!(
+            queue_recv_verdict(100, 50_000),
+            "recv is at least 2x queue; network receive delay likely"
+        );
+        assert_eq!(queue_recv_verdict(9_000, 100), "no clear queue/recv lead");
+        assert_eq!(
+            queue_recv_verdict(50_000, 30_000),
+            "no clear queue/recv lead"
+        );
+    }
+
+    #[test]
+    fn cluster_evidence_connects_pool_pg_capacity_and_recovery_faults() {
+        let mut snapshot = snapshot();
+        snapshot.pools.push(PoolSummary {
+            name: "testpool".to_owned(),
+            size: 4,
+            crush_rule: 0,
+            failure_domain: "host".to_owned(),
+            available_domains: 3,
+            ..PoolSummary::default()
+        });
+        snapshot.osds.push(OsdSummary {
+            name: "osd.2".to_owned(),
+            utilization: 42.0,
+            ..OsdSummary::default()
+        });
+        snapshot.cluster.nearfull_ratio = 0.32;
+        snapshot.cluster.backfillfull_ratio = 0.36;
+        snapshot.cluster.full_ratio = 0.40;
+        snapshot.cluster.recovering_bytes_sec = 2 * 1024 * 1024;
+        snapshot.abnormal_pgs.push(PgSummary {
+            id: "2.a".to_owned(),
+            state: "active+remapped+backfilling".to_owned(),
+            up: vec![9, 1, 2],
+            acting: vec![0, 1, 2],
+        });
+
+        let insights = cluster_evidence_insights(&snapshot);
+
+        assert!(insights.iter().any(|insight| {
+            insight
+                .text
+                .contains("pool testpool size 4 exceeds 3 available host domains")
+        }));
+        assert!(insights.iter().any(|insight| {
+            insight
+                .text
+                .contains("osd.2 utilization 42.000% crosses full threshold 40.000%")
+        }));
+        assert!(insights.iter().any(|insight| {
+            insight
+                .text
+                .contains("PG 2.a active+remapped+backfilling · up [9,1,2] · acting [0,1,2]")
+        }));
+        assert!(
+            insights
+                .iter()
+                .any(|insight| insight.text.contains("2.0 MiB/s"))
+        );
+    }
+
+    #[test]
+    fn deep_scrub_and_block_limit_are_named_directly() {
+        let mut snapshot = snapshot();
+        snapshot.abnormal_pgs.push(PgSummary {
+            id: "2.b".to_owned(),
+            state: "active+clean+scrubbing+deep".to_owned(),
+            up: vec![0, 1, 2],
+            acting: vec![0, 1, 2],
+        });
+        let cluster = cluster_evidence_insights(&snapshot);
+        assert!(
+            cluster
+                .iter()
+                .any(|insight| { insight.text.contains("PG 2.b active+clean+scrubbing+deep") })
+        );
+
+        let nodes = HashMap::from([(
+            "node-b".to_owned(),
+            NodeSummary {
+                host: "node-b".to_owned(),
+                osd_io_write_limits: "osd.2: /dev/vdb 131072".to_owned(),
+                ..NodeSummary::default()
+            },
+        )]);
+        let limits = io_limit_insights(&nodes);
+        assert_eq!(limits.len(), 1);
+        assert!(limits[0].text.contains("node-b OSD block write limit"));
+        assert!(limits[0].text.contains("osd.2"));
     }
 }

@@ -376,7 +376,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         4
     };
     if show_insights {
-        let insight_height = if area.height >= 22 { 5 } else { 3 };
+        let insight_height = insight_height_for(
+            if area.height >= 22 { 8 } else { 5 },
+            app.insights_offset,
+            area.height,
+            trace_min_height,
+        );
         let top_height = clamp_overview_height(
             base_top,
             app.overview_offset,
@@ -415,6 +420,11 @@ fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         draw_overview(frame, app, chunks[0]);
         draw_trace_events(frame, app, chunks[1]);
     }
+}
+
+fn insight_height_for(base: u16, offset: i16, total: u16, trace_min: u16) -> u16 {
+    let max = total.saturating_sub(5 + trace_min).max(3);
+    ((base as i16) + offset).clamp(3, max as i16) as u16
 }
 
 fn clamp_overview_height(base: u16, offset: i16, total: u16, insight: u16, trace_min: u16) -> u16 {
@@ -645,8 +655,12 @@ fn draw_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let visible = area.height.saturating_sub(2).max(1) as usize;
-    let lines = operator_insights(app)
+    let insights = operator_insights(app);
+    let total = insights.len();
+    let scroll = clamp_top_scroll(app.insights_scroll, total, visible);
+    let lines = insights
         .into_iter()
+        .skip(scroll)
         .take(visible)
         .map(insight_line)
         .collect::<Vec<_>>();
@@ -654,7 +668,16 @@ fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .style(Style::default().fg(TEXT))
-            .block(panel(" insights "))
+            .block(scroll_panel(
+                app,
+                PanelFocus::Insights,
+                "insights",
+                total,
+                visible,
+                scroll,
+                false,
+                resize_hint(app, PanelFocus::Insights, area),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -885,6 +908,8 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from("-"),
                 Cell::from("0").style(Style::default().fg(MUTED)),
                 Cell::from("-"),
+                Cell::from("-"),
+                Cell::from("-"),
                 Cell::from("0").style(Style::default().fg(MUTED)),
                 Cell::from("-"),
                 Cell::from(hint).style(Style::default().fg(MUTED)),
@@ -894,6 +919,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("0").style(Style::default().fg(MUTED)),
+                Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
@@ -911,9 +937,9 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .map(|row| {
                 let max_color = latency_color(row.max_us);
                 let graph_width = if compact {
-                    area.width.saturating_sub(46) as usize
+                    area.width.saturating_sub(64) as usize
                 } else {
-                    area.width.saturating_sub(92) as usize
+                    area.width.saturating_sub(99) as usize
                 }
                 .max(12);
                 let graph = trace_sparkline(&row.points, graph_width, trace_active);
@@ -923,6 +949,8 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Cell::from(row.ops.to_string()).style(trace_ops_style(row.ops)),
                         Cell::from(format_latency_us(row.max_us))
                             .style(Style::default().fg(max_color)),
+                        Cell::from(format_latency_us(row.queue_max_us)),
+                        Cell::from(format_latency_us(row.recv_max_us)),
                         Cell::from(row.pg_count.to_string()).style(trace_ops_style(row.ops)),
                         Cell::from(short(&row.hot_pg, 15)).style(Style::default().fg(BLUE)),
                         Cell::from(graph).style(Style::default().fg(max_color)),
@@ -936,6 +964,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Cell::from(format_latency_us(row.max_us))
                             .style(Style::default().fg(max_color)),
                         Cell::from(format_latency_us(row.queue_max_us)),
+                        Cell::from(format_latency_us(row.recv_max_us)),
                         Cell::from(format_latency_us(row.store_max_us)),
                         Cell::from(row.pg_count.to_string()).style(trace_ops_style(row.ops)),
                         Cell::from(short(&row.hot_pg, 21)).style(Style::default().fg(BLUE)),
@@ -952,11 +981,15 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(7),
                 Constraint::Length(6),
                 Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(7),
                 Constraint::Length(5),
                 Constraint::Length(15),
                 Constraint::Min(12),
             ],
-            Row::new(["OSD", "Ops", "Max", "PGs", "Busy PG", "Max/2s"]),
+            Row::new([
+                "OSD", "Ops", "Max", "Queue", "Recv", "PGs", "Busy PG", "Max/2s",
+            ]),
         )
     } else {
         (
@@ -968,12 +1001,14 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(7),
+                Constraint::Length(7),
                 Constraint::Length(5),
                 Constraint::Length(21),
                 Constraint::Min(16),
             ],
             Row::new([
-                "OSD", "Host", "Ops", "Avg", "Max", "Queue", "Store", "PGs", "Busy PG", "Max/2s",
+                "OSD", "Host", "Ops", "Avg", "Max", "Queue", "Recv", "Store", "PGs", "Busy PG",
+                "Max/2s",
             ]),
         )
     };
@@ -1689,7 +1724,10 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .max()
         .unwrap_or(4)
         .max(4) as u16;
-    let compact = area.width < (60 + host_width).max(72);
+    // The full table needs every fixed column plus the complete host name.
+    // Stay compact until that actually fits instead of letting ratatui squeeze
+    // the Host column first.
+    let compact = area.width < (88 + host_width).max(72);
     let visible = table_visible_rows(area);
     let total = osds.len();
     let scroll = clamp_top_scroll(app.osds_scroll, total, visible);
@@ -1708,8 +1746,6 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
                 Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
                 Cell::from(map_state).style(status_style),
-                Cell::from(osd.pgs.to_string()),
-                Cell::from(pg_bar).style(Style::default().fg(BLUE)),
             ])
         } else {
             Row::new(vec![
@@ -1733,12 +1769,10 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (
             vec![
                 Constraint::Length(7),
-                Constraint::Length(host_width),
+                Constraint::Min(host_width),
                 Constraint::Length(8),
-                Constraint::Length(5),
-                Constraint::Length(10),
             ],
-            Row::new(vec!["OSD", "Host", "State", "PGs", "PG load"]),
+            Row::new(vec!["OSD", "Host", "State"]),
         )
     } else {
         (
@@ -1870,7 +1904,7 @@ fn panel_resizable(mode: &Mode, focus: PanelFocus) -> bool {
     match focus {
         PanelFocus::Logs => true,
         PanelFocus::Nodes | PanelFocus::Osds => matches!(mode, Mode::Live),
-        PanelFocus::Trace => matches!(mode, Mode::Live),
+        PanelFocus::Insights | PanelFocus::Trace => matches!(mode, Mode::Live),
     }
 }
 
@@ -2205,6 +2239,14 @@ mod tests {
         assert!(rendered.contains("pg      -"));
     }
 
+    #[test]
+    fn insights_height_uses_a_larger_default_and_respects_resize_bounds() {
+        assert_eq!(insight_height_for(8, 0, 30, 7), 8);
+        assert_eq!(insight_height_for(8, 3, 30, 7), 11);
+        assert_eq!(insight_height_for(8, -5, 30, 7), 3);
+        assert_eq!(insight_height_for(8, 12, 20, 7), 8);
+    }
+
     fn draft() -> ConfigDraft {
         ConfigDraft {
             profile: "test".to_owned(),
@@ -2244,10 +2286,12 @@ mod tests {
             event_log_height: 5,
             terminal_height: 24,
             overview_offset: 0,
+            insights_offset: 0,
             show_help: false,
             focused_panel: PanelFocus::Osds,
             nodes_scroll: 0,
             osds_scroll: 0,
+            insights_scroll: 0,
             trace_scroll: 0,
             logs_scroll: 0,
             node_summaries: HashMap::new(),
@@ -2301,9 +2345,11 @@ mod tests {
                 reweight: 1.0,
                 ..OsdSummary::default()
             }],
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
         });
 
-        let backend = TestBackend::new(140, 10);
+        let backend = TestBackend::new(70, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -2333,6 +2379,8 @@ mod tests {
                 reweight: 1.0,
                 ..OsdSummary::default()
             }],
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
         });
 
         // 90 cols wide is < 110 (2-panel mode)
@@ -2380,6 +2428,8 @@ mod tests {
                 reweight: 1.0,
                 ..OsdSummary::default()
             }],
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
         });
 
         // 115 cols wide is >= 110 (3-panel mode)

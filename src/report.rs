@@ -91,6 +91,7 @@ pub(crate) fn build_report(path: &Path) -> Result<String> {
     push_line(&mut out, "");
 
     push_cluster(&mut out, last);
+    push_cluster_evidence(&mut out, last);
     push_nodes(&mut out, &last.nodes);
     push_trace_coverage(&mut out, &logs);
     push_insights(&mut out, &insights);
@@ -202,6 +203,74 @@ fn push_cluster(out: &mut String, snapshot: &Snapshot) {
             cluster.read_ops_sec, cluster.write_ops_sec
         ),
     );
+    if cluster.recovering_bytes_sec > 0 {
+        push_line(
+            out,
+            &format!(
+                "- Recovery/backfill: `{}` bytes/s",
+                cluster.recovering_bytes_sec
+            ),
+        );
+    }
+    if cluster.full_ratio > 0.0 {
+        push_line(
+            out,
+            &format!(
+                "- Capacity ratios: nearfull `{:.3}%`, backfillfull `{:.3}%`, full `{:.3}%`",
+                cluster.nearfull_ratio * 100.0,
+                cluster.backfillfull_ratio * 100.0,
+                cluster.full_ratio * 100.0
+            ),
+        );
+    }
+    for check in &cluster.health_checks {
+        push_line(
+            out,
+            &format!(
+                "- Health check `{}`: {}",
+                check.code,
+                md_cell(&check.message)
+            ),
+        );
+        for detail in &check.details {
+            push_line(out, &format!("  - {}", md_cell(detail)));
+        }
+    }
+    push_line(out, "");
+}
+
+fn push_cluster_evidence(out: &mut String, snapshot: &Snapshot) {
+    if snapshot.pools.is_empty() && snapshot.abnormal_pgs.is_empty() {
+        return;
+    }
+    push_line(out, "## cluster evidence");
+    push_line(out, "");
+    for pool in &snapshot.pools {
+        push_line(
+            out,
+            &format!(
+                "- Pool `{}`: size `{}`, min_size `{}`, rule `{}`, failure domain `{}` (`{}` available)",
+                md_cell(&pool.name),
+                pool.size,
+                pool.min_size,
+                pool.crush_rule,
+                md_cell(value_or_dash(&pool.failure_domain)),
+                pool.available_domains
+            ),
+        );
+    }
+    for pg in &snapshot.abnormal_pgs {
+        push_line(
+            out,
+            &format!(
+                "- PG `{}`: `{}`; up `{:?}`; acting `{:?}`",
+                md_cell(&pg.id),
+                md_cell(&pg.state),
+                pg.up,
+                pg.acting
+            ),
+        );
+    }
     push_line(out, "");
 }
 
@@ -215,21 +284,22 @@ fn push_nodes(out: &mut String, nodes: &[NodeSummary]) {
     }
     push_line(
         out,
-        "| Host | Hostname | Sudo | OSDs | CPU | Mem | Deployment | Ceph version | Error |",
+        "| Host | Hostname | Sudo | OSDs | OSD write limit | CPU | Mem | Deployment | Ceph version | Error |",
     );
     push_line(
         out,
-        "| --- | --- | --- | --- | ---: | ---: | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |",
     );
     for node in nodes {
         push_line(
             out,
             &format!(
-                "| {} | {} | {} | {} | {:.1}% | {:.1}% | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {:.1}% | {:.1}% | {} | {} | {} |",
                 md_cell(&node.host),
                 md_cell(value_or_dash(&node.hostname)),
                 md_cell(value_or_dash(&node.sudo)),
                 md_cell(value_or_dash(&node.osd_ids)),
+                md_cell(value_or_dash(&node.osd_io_write_limits)),
                 node.cpu_percent,
                 node.mem_percent,
                 md_cell(value_or_dash(&node.deployment)),
@@ -300,23 +370,24 @@ fn push_osd_trace(out: &mut String, rows: &[crate::trace::TraceGraphRow]) {
     }
     push_line(
         out,
-        "| OSD | Host | Ops | Avg | Max | Queue | Store | KV commit | Busy PG |",
+        "| OSD | Host | Ops | Avg | Max | Queue | Recv | Store | KV commit | Busy PG |",
     );
     push_line(
         out,
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     );
     for row in active_rows.into_iter().take(20) {
         push_line(
             out,
             &format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 md_cell(&row.osd),
                 md_cell(&row.host),
                 row.ops,
                 format_latency_us(row.avg_us),
                 format_latency_us(row.max_us),
                 format_latency_us(row.queue_max_us),
+                format_latency_us(row.recv_max_us),
                 format_latency_us(row.store_max_us),
                 format_latency_us(row.kv_commit_max_us),
                 md_cell(&row.hot_pg)
@@ -450,6 +521,8 @@ mod tests {
                 host: "node-a".to_owned(),
                 ..OsdSummary::default()
             }],
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
         }
     }
 
@@ -472,7 +545,7 @@ mod tests {
         assert!(report.contains("largest observed component queue 20.0ms"));
         assert!(report.contains("- Parsed events: osd `1`, kfs `0`, rados `0`"));
         assert!(report.contains(
-            "| node-a | node-a | ok | - | 90.0% | 0.0% | generic | ceph version test | - |"
+            "| node-a | node-a | ok | - | - | 90.0% | 0.0% | generic | ceph version test | - |"
         ));
         assert!(report.contains("| osd.1 | node-a | 1 | 25.0ms | 25.0ms |"));
         let _ = fs::remove_dir_all(dir);
