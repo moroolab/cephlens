@@ -444,14 +444,24 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        draw_osds(frame, app, chunks[1]);
+        if app.focused_panel == PanelFocus::Nodes {
+            draw_nodes(frame, app, chunks[1]);
+        } else {
+            draw_osds(frame, app, chunks[1]);
+        }
     } else if area.height >= 12 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(7), Constraint::Min(5)])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        draw_osds(frame, app, chunks[1]);
+        if app.focused_panel == PanelFocus::Nodes {
+            draw_nodes(frame, app, chunks[1]);
+        } else {
+            draw_osds(frame, app, chunks[1]);
+        }
+    } else if app.focused_panel == PanelFocus::Nodes {
+        draw_nodes(frame, app, area);
     } else {
         draw_osds(frame, app, area);
     }
@@ -1553,7 +1563,13 @@ fn osdtrace_glyph(app: &App, host: &str) -> (&'static str, Color) {
 }
 
 fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let rows = node_rows(app);
+    let max_host_len = app.hosts.iter().map(|h| h.len()).max().unwrap_or(4).max(4);
+    let host_width = if area.width >= 50 {
+        max_host_len.max(9)
+    } else {
+        9
+    };
+    let rows = node_rows(app, host_width);
     let visible = table_visible_rows(area);
     let total = rows.len();
     let scroll = clamp_top_scroll(app.nodes_scroll, total, visible);
@@ -1561,7 +1577,7 @@ fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Table::new(
             rows.into_iter().skip(scroll).take(visible),
             [
-                Constraint::Length(9),
+                Constraint::Length(host_width as u16),
                 Constraint::Length(6),
                 Constraint::Length(2),
                 Constraint::Length(4),
@@ -1588,7 +1604,7 @@ fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn node_rows(app: &App) -> Vec<Row<'static>> {
+fn node_rows(app: &App, host_width: usize) -> Vec<Row<'static>> {
     let replay_nodes = app
         .snapshot
         .as_ref()
@@ -1629,7 +1645,7 @@ fn node_rows(app: &App) -> Vec<Row<'static>> {
                 .unwrap_or_else(|| "-".to_owned());
             let (glyph, glyph_color) = osdtrace_glyph(app, host);
             Row::new(vec![
-                Cell::from(short(host, 9)).style(Style::default().fg(ACCENT).bold()),
+                Cell::from(short(host, host_width)).style(Style::default().fg(ACCENT).bold()),
                 Cell::from(state).style(Style::default().fg(color).bold()),
                 Cell::from(glyph).style(Style::default().fg(glyph_color).bold()),
                 Cell::from(osds),
@@ -1655,7 +1671,13 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .unwrap_or(&[]);
 
     let max_pgs = osds.iter().map(|osd| osd.pgs).max().unwrap_or(1).max(1);
-    let compact = area.width < 72;
+    let host_width = osds
+        .iter()
+        .map(|osd| osd.host.len())
+        .max()
+        .unwrap_or(4)
+        .max(4) as u16;
+    let compact = area.width < (60 + host_width).max(72);
     let visible = table_visible_rows(area);
     let total = osds.len();
     let scroll = clamp_top_scroll(app.osds_scroll, total, visible);
@@ -1699,7 +1721,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (
             vec![
                 Constraint::Length(7),
-                Constraint::Length(12),
+                Constraint::Length(host_width),
                 Constraint::Length(8),
                 Constraint::Length(5),
                 Constraint::Length(10),
@@ -1710,7 +1732,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (
             vec![
                 Constraint::Length(7),
-                Constraint::Length(12),
+                Constraint::Length(host_width),
                 Constraint::Length(8),
                 Constraint::Length(9),
                 Constraint::Length(5),
@@ -2000,7 +2022,10 @@ fn format_kb(kb: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow::FlowStats;
+    use crate::editor::{ConfigDraft, ConfigEditor};
+    use crate::flow::{FlowMetric, FlowSort, FlowStats};
+    use crate::model::{OsdSummary, Snapshot};
+    use crate::trace::TraceInstallConfig;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
@@ -2166,5 +2191,162 @@ mod tests {
 
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("pg      -"));
+    }
+
+    fn draft() -> ConfigDraft {
+        ConfigDraft {
+            profile: "test".to_owned(),
+            admin_host: "host1".to_owned(),
+            hosts: vec!["host1".to_owned()],
+            client_hosts: Vec::new(),
+            refresh_secs: 1,
+            trace_auto_start: false,
+            trace_window_secs: 10,
+            trace_latency_ms: 1,
+            trace_ttl_secs: 1800,
+            osdtrace_url: String::new(),
+            osdtrace_sha256: String::new(),
+            osdtrace_allow_unverified: false,
+        }
+    }
+
+    fn test_app() -> App {
+        let (tx, rx) = std::sync::mpsc::channel();
+        App {
+            profile: "test".to_owned(),
+            hosts: vec!["host1".to_owned()],
+            client_hosts: Vec::new(),
+            admin_host: "host1".to_owned(),
+            config_path: None,
+            config_editor: ConfigEditor::new(draft()),
+            refresh: std::time::Duration::from_secs(1),
+            mode: Mode::Live,
+            snapshot: None,
+            confirm_quit: false,
+            shutting_down: false,
+            trace_probing: false,
+            pending_trace_action: None,
+            tx,
+            rx,
+            logs: Vec::new(),
+            event_log_height: 5,
+            terminal_height: 24,
+            overview_offset: 0,
+            show_help: false,
+            focused_panel: PanelFocus::Osds,
+            nodes_scroll: 0,
+            osds_scroll: 0,
+            trace_scroll: 0,
+            logs_scroll: 0,
+            node_summaries: HashMap::new(),
+            stream_statuses: HashMap::new(),
+            trace_targets: Vec::new(),
+            trace_events: Vec::new(),
+            trace_series: HashMap::new(),
+            trace_active: 0,
+            trace_following: false,
+            trace_session: None,
+            trace_source: TraceSource::Osdtrace,
+            flow_view: false,
+            flow_metric: FlowMetric::Latency,
+            flow_sort: FlowSort::Descending,
+            flow_scroll: 0,
+            kfstrace_events: Vec::new(),
+            kfstrace_active: 0,
+            kfstrace_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kfstrace_session: None,
+            radostrace_events: Vec::new(),
+            radostrace_active: 0,
+            radostrace_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            radostrace_session: None,
+            trace_auto_start: false,
+            trace_window_secs: 10,
+            trace_latency_ms: 0,
+            trace_ttl_secs: 0,
+            trace_install: TraceInstallConfig::default(),
+            trace_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stream_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_path: None,
+            session_records: 0,
+        }
+    }
+
+    #[test]
+    fn osd_map_accommodates_long_hostnames() {
+        let mut app = test_app();
+        app.snapshot = Some(Snapshot {
+            captured_at: chrono::Utc::now(),
+            profile: "test".to_owned(),
+            admin_host: "storage-node-production-01.ceph.example.com".to_owned(),
+            hosts: vec!["storage-node-production-01.ceph.example.com".to_owned()],
+            trace_window_secs: 10,
+            cluster: ClusterSummary::default(),
+            nodes: Vec::new(),
+            osds: vec![OsdSummary {
+                name: "osd.0".to_owned(),
+                host: "storage-node-production-01.ceph.example.com".to_owned(),
+                status: "up".to_owned(),
+                reweight: 1.0,
+                ..OsdSummary::default()
+            }],
+        });
+
+        let backend = TestBackend::new(140, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_osds(frame, &app, frame.area());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("storage-node-production-01.ceph.example.com"));
+    }
+
+    #[test]
+    fn overview_narrow_displays_nodes_when_focused() {
+        let mut app = test_app();
+        app.snapshot = Some(Snapshot {
+            captured_at: chrono::Utc::now(),
+            profile: "test".to_owned(),
+            admin_host: "host1".to_owned(),
+            hosts: vec!["host1".to_owned()],
+            trace_window_secs: 10,
+            cluster: ClusterSummary::default(),
+            nodes: Vec::new(),
+            osds: vec![OsdSummary {
+                name: "osd.0".to_owned(),
+                host: "host1".to_owned(),
+                status: "up".to_owned(),
+                reweight: 1.0,
+                ..OsdSummary::default()
+            }],
+        });
+
+        // 100 cols wide is < 142 (narrow mode)
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Focused on Osds -> shows osd map
+        app.focused_panel = PanelFocus::Osds;
+        terminal
+            .draw(|frame| {
+                draw_overview(frame, &app, frame.area());
+            })
+            .unwrap();
+        let rendered_osds = buffer_text(terminal.backend().buffer());
+        assert!(rendered_osds.contains("osd map"));
+        assert!(!rendered_osds.contains("nodes"));
+
+        // Focused on Nodes -> shows nodes
+        app.focused_panel = PanelFocus::Nodes;
+        terminal
+            .draw(|frame| {
+                draw_overview(frame, &app, frame.area());
+            })
+            .unwrap();
+        let rendered_nodes = buffer_text(terminal.backend().buffer());
+        assert!(rendered_nodes.contains("nodes"));
+        assert!(!rendered_nodes.contains("osd map"));
     }
 }
