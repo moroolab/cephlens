@@ -49,12 +49,19 @@ In a source clone, use `cargo run -- init-config`, edit the generated file, then
 
 ## Features
 
-- Live cluster health, quorum, OSD counts, and IO throughput over a single SSH stream.
+- Live cluster health, quorum, OSD counts, IO throughput, abnormal PG mappings,
+  pool replica/failure-domain evidence, and capacity thresholds over a single
+  SSH stream.
 - Per-node readiness: connection state, OSD ids, CPU and memory percent, IO stall
-  share from `/proc/pressure/io`, and Ceph version/deployment.
+  share from `/proc/pressure/io`, OSD service block-write limits, and Ceph
+  version/deployment.
 - Per-OSD commit and apply latency from `ceph osd perf` next to the eBPF trace
-  numbers, and health check names read straight out of `ceph -s`.
+  numbers, and health check names and first details read straight out of
+  `ceph -s`.
 - osdtrace eBPF latency tracing with per-OSD and per-PG breakdown of queue, BlueStore, and KV-commit latency.
+- Queue and receive latency are shown together in compact and wide trace tables.
+  Once either value exceeds 10ms and doubles the other, Insights names the
+  likely OSD-processing or network-delay fault class.
 - A flow view that renders each observed op as an OSD -> placement group ->
   object path. radostrace supplies the complete path; with only osdtrace, the
   path stops at the placement group. Each row carries op count, latency, and
@@ -167,7 +174,8 @@ trace_ttl_secs = 1800
 ```
 
 `admin_host` is the host where cephlens runs Ceph admin commands such as
-`ceph -s`, `ceph osd tree`, and `ceph osd df`. The `hosts` list is the set of
+`ceph -s`, `ceph osd tree`, `ceph osd df`, and read-only PG/pool queries. The
+`hosts` list is the set of
 machines that get persistent node-readiness SSH streams and osdtrace runners.
 `client_hosts` is optional; when set, it is where kfstrace and radostrace run.
 Leave it out if you only want the OSD-side osdtrace view.
@@ -225,6 +233,9 @@ admin host:
   sudo -n ceph osd tree --format json
   sudo -n ceph osd df --format json
   sudo -n ceph osd perf --format json
+  sudo -n ceph osd dump --format json
+  sudo -n ceph osd crush rule dump --format json
+  sudo -n ceph pg dump pgs --format json
   sudo -n rados --version
 
 bench command:
@@ -301,7 +312,7 @@ x          clear captured trace events
 ?          toggle the help overlay
 [/-        shrink the focused panel
 ]/+        grow the focused panel
-Tab        focus next panel
+Tab        focus next panel, including insights
 Shift+Tab  focus previous panel
 Up/Down or j/k    scroll focused panel
 PgUp/PgDn  scroll focused panel faster
@@ -334,13 +345,17 @@ appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
 host for node readiness. `refresh_secs` is the pause between ticks, so the
 period an operator sees is that pause plus the time the remote queries take. On
-each cluster tick, `ceph -s` refreshes while one of `ceph osd tree`, `ceph osd
-df`, and `ceph osd perf` rotates in. Static node facts are collected when the
-stream connects, OSD processes are scanned no more often than every five
-seconds, and CPU, memory, and pressure values follow `refresh_secs`. The node
+each cluster tick, `ceph -s`, `ceph osd dump`, and `ceph pg dump pgs` refresh
+while one of `ceph osd tree`, `ceph osd df`, `ceph osd perf`, and `ceph osd
+crush rule dump` rotates in. Static node facts are collected when the stream
+connects, OSD processes are scanned no more often than every five seconds, and
+CPU, memory, and pressure values follow `refresh_secs`. That OSD scan also
+reads any systemd `IOWriteBandwidthMax` applied to an OSD service. The node
 table shows connection state (`live`, `dial`, `retry`, `error`), OSD ids, CPU
 percentage, and memory percentage. The TUI redraws after input or new stream
-data instead of on every event poll.
+data instead of on every event poll. The insights panel starts taller than
+before and, like the overview, trace, and event-log panels, can be focused with
+`Tab` and resized with `+` or `-`.
 When `trace_auto_start` is true, cephlens starts osdtrace runners as soon as the
 TUI opens. The default config keeps it false so an operator explicitly starts
 and stops tracing with `t`, `f`, `r`, or `a`.

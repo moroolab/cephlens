@@ -15,6 +15,10 @@ pub(crate) struct Snapshot {
     pub(crate) cluster: ClusterSummary,
     pub(crate) nodes: Vec<NodeSummary>,
     pub(crate) osds: Vec<OsdSummary>,
+    #[serde(default)]
+    pub(crate) pools: Vec<PoolSummary>,
+    #[serde(default)]
+    pub(crate) abnormal_pgs: Vec<PgSummary>,
 }
 
 fn legacy_trace_window_secs() -> u64 {
@@ -41,7 +45,15 @@ pub(crate) struct ClusterSummary {
     pub(crate) write_bytes_sec: u64,
     pub(crate) read_ops_sec: u64,
     pub(crate) write_ops_sec: u64,
+    #[serde(default)]
+    pub(crate) recovering_bytes_sec: u64,
     pub(crate) pg_states: String,
+    #[serde(default)]
+    pub(crate) nearfull_ratio: f64,
+    #[serde(default)]
+    pub(crate) backfillfull_ratio: f64,
+    #[serde(default)]
+    pub(crate) full_ratio: f64,
     #[serde(default)]
     pub(crate) health_checks: Vec<HealthCheck>,
 }
@@ -54,6 +66,8 @@ pub(crate) struct HealthCheck {
     pub(crate) code: String,
     pub(crate) severity: String,
     pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) details: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -67,6 +81,8 @@ pub(crate) struct NodeSummary {
     pub(crate) deployment: String,
     pub(crate) ceph_osd_processes: u64,
     pub(crate) osd_ids: String,
+    #[serde(default)]
+    pub(crate) osd_io_write_limits: String,
     #[serde(default)]
     pub(crate) cpu_percent: f64,
     #[serde(default)]
@@ -99,4 +115,23 @@ pub(crate) struct OsdSummary {
     pub(crate) commit_latency_ms: u64,
     #[serde(default)]
     pub(crate) apply_latency_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct PoolSummary {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) min_size: u64,
+    pub(crate) crush_rule: i64,
+    pub(crate) failure_domain: String,
+    pub(crate) available_domains: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct PgSummary {
+    pub(crate) id: String,
+    pub(crate) state: String,
+    pub(crate) up: Vec<i64>,
+    pub(crate) acting: Vec<i64>,
 }

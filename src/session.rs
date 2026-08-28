@@ -157,6 +157,8 @@ mod tests {
             cluster: ClusterSummary::default(),
             nodes: Vec::new(),
             osds: Vec::new(),
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
         }
     }
 

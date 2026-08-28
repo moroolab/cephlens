@@ -389,10 +389,12 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
         event_log_height: EVENT_LOG_DEFAULT_HEIGHT,
         terminal_height: 24,
         overview_offset: 0,
+        insights_offset: 0,
         show_help: false,
         focused_panel: PanelFocus::Osds,
         nodes_scroll: 0,
         osds_scroll: 0,
+        insights_scroll: 0,
         trace_scroll: 0,
         logs_scroll: 0,
         node_summaries: HashMap::new(),
@@ -479,10 +481,12 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         event_log_height: EVENT_LOG_DEFAULT_HEIGHT,
         terminal_height: 24,
         overview_offset: 0,
+        insights_offset: 0,
         show_help: false,
         focused_panel: PanelFocus::Osds,
         nodes_scroll: 0,
         osds_scroll: 0,
+        insights_scroll: 0,
         trace_scroll: 0,
         logs_scroll: 0,
         node_summaries: HashMap::new(),
@@ -781,6 +785,9 @@ fn resize_focused_panel(app: &mut App, delta: i16) {
         PanelFocus::Osds | PanelFocus::Nodes => {
             app.overview_offset = (app.overview_offset + delta).clamp(-6, 12);
         }
+        PanelFocus::Insights => {
+            app.insights_offset = (app.insights_offset + delta).clamp(-5, 12);
+        }
         PanelFocus::Trace => {
             app.overview_offset = (app.overview_offset - delta).clamp(-6, 12);
         }
@@ -847,6 +854,7 @@ fn focus_next_panel(app: &mut App, delta: i32) {
 fn focusable_panels() -> &'static [PanelFocus] {
     &[
         PanelFocus::Osds,
+        PanelFocus::Insights,
         PanelFocus::Trace,
         PanelFocus::Logs,
         PanelFocus::Nodes,
@@ -871,6 +879,7 @@ fn focused_scroll_mut(app: &mut App) -> &mut usize {
     match app.focused_panel {
         PanelFocus::Nodes => &mut app.nodes_scroll,
         PanelFocus::Osds => &mut app.osds_scroll,
+        PanelFocus::Insights => &mut app.insights_scroll,
         // The flow view replaces the trace panel, so the trace focus scrolls
         // whichever of the two is on screen.
         PanelFocus::Trace if app.flow_view => &mut app.flow_scroll,

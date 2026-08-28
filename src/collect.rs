@@ -6,7 +6,9 @@ use serde_json::Value;
 
 use crate::{
     config::ResolvedConfig,
-    model::{ClusterSummary, HealthCheck, NodeSummary, OsdSummary, Snapshot},
+    model::{
+        ClusterSummary, HealthCheck, NodeSummary, OsdSummary, PgSummary, PoolSummary, Snapshot,
+    },
     ssh::ssh_capture,
     stream::node_facts_snippet,
     util::{MAX_PARALLEL_HOSTS, map_parallel, ptr_f64, ptr_i64, ptr_str, ptr_u64, shell_quote},
@@ -19,6 +21,13 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
     // Latency is supplementary, so a cluster that refuses this query still gets
     // a snapshot.
     let perf_out = ssh_capture(&cfg.admin_host, "sudo -n ceph osd perf --format json").ok();
+    let osdmap_out = ssh_capture(&cfg.admin_host, "sudo -n ceph osd dump --format json").ok();
+    let crush_out = ssh_capture(
+        &cfg.admin_host,
+        "sudo -n ceph osd crush rule dump --format json",
+    )
+    .ok();
+    let pgs_out = ssh_capture(&cfg.admin_host, "sudo -n ceph pg dump pgs --format json").ok();
 
     let status: Value = serde_json::from_str(status_out.trim())
         .with_context(|| "failed to parse ceph status json")?;
@@ -27,9 +36,14 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
     let df: Value =
         serde_json::from_str(df_out.trim()).with_context(|| "failed to parse osd df json")?;
     let perf = perf_out.and_then(|perf| serde_json::from_str::<Value>(perf.trim()).ok());
+    let osdmap = osdmap_out.and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok());
+    let crush = crush_out.and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok());
+    let pgs = pgs_out.and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok());
 
-    let cluster = parse_cluster_summary(&status);
+    let cluster = parse_cluster_summary(&status, osdmap.as_ref());
     let osds = parse_osds(&tree, &df, perf.as_ref());
+    let pools = parse_pools(osdmap.as_ref(), crush.as_ref(), &tree);
+    let abnormal_pgs = parse_abnormal_pgs(pgs.as_ref());
     let nodes = map_parallel(&cfg.hosts, MAX_PARALLEL_HOSTS, |host| collect_node(host))
         .into_iter()
         .zip(&cfg.hosts)
@@ -45,10 +59,12 @@ pub(crate) fn collect_snapshot(cfg: &ResolvedConfig) -> Result<Snapshot> {
         cluster,
         nodes,
         osds,
+        pools,
+        abnormal_pgs,
     })
 }
 
-pub(crate) fn parse_cluster_summary(status: &Value) -> ClusterSummary {
+pub(crate) fn parse_cluster_summary(status: &Value, osdmap: Option<&Value>) -> ClusterSummary {
     let pg_states = status
         .pointer("/pgmap/pgs_by_state")
         .and_then(Value::as_array)
@@ -99,7 +115,17 @@ pub(crate) fn parse_cluster_summary(status: &Value) -> ClusterSummary {
         write_bytes_sec: ptr_u64(status, "/pgmap/write_bytes_sec"),
         read_ops_sec: ptr_u64(status, "/pgmap/read_op_per_sec"),
         write_ops_sec: ptr_u64(status, "/pgmap/write_op_per_sec"),
+        recovering_bytes_sec: ptr_u64(status, "/pgmap/recovering_bytes_per_sec"),
         pg_states,
+        nearfull_ratio: osdmap
+            .map(|map| ptr_f64(map, "/nearfull_ratio"))
+            .unwrap_or_default(),
+        backfillfull_ratio: osdmap
+            .map(|map| ptr_f64(map, "/backfillfull_ratio"))
+            .unwrap_or_default(),
+        full_ratio: osdmap
+            .map(|map| ptr_f64(map, "/full_ratio"))
+            .unwrap_or_default(),
         health_checks: parse_health_checks(status),
     }
 }
@@ -114,10 +140,119 @@ fn parse_health_checks(status: &Value) -> Vec<HealthCheck> {
             code: code.clone(),
             severity: ptr_str(check, "/severity"),
             message: ptr_str(check, "/summary/message"),
+            details: check
+                .pointer("/detail")
+                .and_then(Value::as_array)
+                .map(|details| {
+                    details
+                        .iter()
+                        .filter_map(|detail| detail.pointer("/message").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect::<Vec<_>>();
     parsed.sort_by(|left, right| left.code.cmp(&right.code));
     parsed
+}
+
+pub(crate) fn parse_pools(
+    osdmap: Option<&Value>,
+    crush: Option<&Value>,
+    tree: &Value,
+) -> Vec<PoolSummary> {
+    let domains_by_rule = crush
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|rule| {
+                    let id = rule.pointer("/rule_id")?.as_i64()?;
+                    let domain = rule
+                        .pointer("/steps")?
+                        .as_array()?
+                        .iter()
+                        .find(|step| ptr_str(step, "/op").starts_with("chooseleaf"))
+                        .map(|step| ptr_str(step, "/type"))
+                        .filter(|domain| !domain.is_empty())?;
+                    Some((id, domain))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let domain_counts = tree
+        .pointer("/nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes.iter().fold(HashMap::new(), |mut counts, node| {
+                let kind = ptr_str(node, "/type");
+                if !kind.is_empty() {
+                    *counts.entry(kind).or_insert(0_u64) += 1;
+                }
+                counts
+            })
+        })
+        .unwrap_or_default();
+
+    let mut pools = osdmap
+        .and_then(|map| map.pointer("/pools"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|pool| {
+                    let crush_rule = ptr_i64(pool, "/crush_rule");
+                    let failure_domain = domains_by_rule
+                        .get(&crush_rule)
+                        .cloned()
+                        .unwrap_or_default();
+                    PoolSummary {
+                        id: ptr_i64(pool, "/pool"),
+                        name: ptr_str(pool, "/pool_name"),
+                        size: ptr_u64(pool, "/size"),
+                        min_size: ptr_u64(pool, "/min_size"),
+                        crush_rule,
+                        available_domains: domain_counts
+                            .get(&failure_domain)
+                            .copied()
+                            .unwrap_or_default(),
+                        failure_domain,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    pools.sort_by_key(|pool| pool.id);
+    pools
+}
+
+pub(crate) fn parse_abnormal_pgs(pgs: Option<&Value>) -> Vec<PgSummary> {
+    let mut parsed = pgs
+        .and_then(|dump| dump.pointer("/pg_stats"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|pg| ptr_str(pg, "/state") != "active+clean")
+                .map(|pg| PgSummary {
+                    id: ptr_str(pg, "/pgid"),
+                    state: ptr_str(pg, "/state"),
+                    up: parse_i64_array(pg.pointer("/up")),
+                    acting: parse_i64_array(pg.pointer("/acting")),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    parsed.sort_by(|left, right| left.id.cmp(&right.id));
+    parsed
+}
+
+fn parse_i64_array(value: Option<&Value>) -> Vec<i64> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
 }
 
 /// Maps OSD id to the latency `ceph osd perf` reports. The payload is optional,
@@ -216,6 +351,7 @@ printf 'ceph_version=%s\n' "$ceph_version"
 printf 'deployment=%s\n' "$deployment"
 printf 'ceph_osd_processes=%s\n' "$count"
 printf 'osd_ids=%s\n' "$ids"
+printf 'osd_io_write_limits=%s\n' "$io_limits"
 printf 'cpu_percent=%s\n' "$cpu_pct"
 printf 'mem_percent=%s\n' "$mem_pct"
 printf 'io_stall_percent=%s\n' "$io_stall"
@@ -237,6 +373,7 @@ printf 'cpu_stall_percent=%s\n' "$cpu_stall"
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_default(),
                 osd_ids: map.get("osd_ids").cloned().unwrap_or_default(),
+                osd_io_write_limits: map.get("osd_io_write_limits").cloned().unwrap_or_default(),
                 cpu_percent: map
                     .get("cpu_percent")
                     .and_then(|s| s.parse().ok())
@@ -388,12 +525,13 @@ mod tests {
     fn cluster_summary_names_the_failing_health_checks() {
         let status: Value = serde_json::from_str(
             r#"{"health":{"status":"HEALTH_WARN","checks":{
-                 "OSD_NEARFULL":{"severity":"HEALTH_WARN","summary":{"message":"1 nearfull osd(s)"}},
+                 "OSD_NEARFULL":{"severity":"HEALTH_WARN","summary":{"message":"1 nearfull osd(s)"},
+                   "detail":[{"message":"osd.2 is near full at 85%"}]},
                  "MON_CLOCK_SKEW":{"severity":"HEALTH_WARN","summary":{"message":"clock skew detected"}}}}}"#,
         )
         .unwrap();
 
-        let cluster = parse_cluster_summary(&status);
+        let cluster = parse_cluster_summary(&status, None);
 
         let codes = cluster
             .health_checks
@@ -402,6 +540,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(codes, vec!["MON_CLOCK_SKEW", "OSD_NEARFULL"]);
         assert_eq!(cluster.health_checks[1].message, "1 nearfull osd(s)");
+        assert_eq!(
+            cluster.health_checks[1].details,
+            vec!["osd.2 is near full at 85%"]
+        );
     }
 
     #[test]
@@ -410,7 +552,73 @@ mod tests {
             serde_json::from_str(r#"{"health":{"status":"HEALTH_OK","checks":{},"mutes":[]}}"#)
                 .unwrap();
 
-        assert!(parse_cluster_summary(&status).health_checks.is_empty());
+        assert!(
+            parse_cluster_summary(&status, None)
+                .health_checks
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cluster_summary_reads_recovery_rate_and_capacity_thresholds() {
+        let status: Value = serde_json::from_str(
+            r#"{"pgmap":{"recovering_bytes_per_sec":1048576},"health":{"status":"HEALTH_OK"}}"#,
+        )
+        .unwrap();
+        let osdmap: Value = serde_json::from_str(
+            r#"{"nearfull_ratio":0.75,"backfillfull_ratio":0.8,"full_ratio":0.85}"#,
+        )
+        .unwrap();
+
+        let cluster = parse_cluster_summary(&status, Some(&osdmap));
+
+        assert_eq!(cluster.recovering_bytes_sec, 1_048_576);
+        assert_eq!(cluster.nearfull_ratio, 0.75);
+        assert_eq!(cluster.backfillfull_ratio, 0.8);
+        assert_eq!(cluster.full_ratio, 0.85);
+    }
+
+    #[test]
+    fn pools_include_crush_failure_domain_capacity() {
+        let osdmap: Value = serde_json::from_str(
+            r#"{"pools":[{"pool":2,"pool_name":"testpool","size":4,"min_size":2,"crush_rule":0}]}"#,
+        )
+        .unwrap();
+        let crush: Value = serde_json::from_str(
+            r#"[{"rule_id":0,"steps":[{"op":"take","item":-1},{"op":"chooseleaf_firstn","type":"host"},{"op":"emit"}]}]"#,
+        )
+        .unwrap();
+        let tree: Value = serde_json::from_str(
+            r#"{"nodes":[{"type":"root","name":"default"},{"type":"host","name":"node-1"},{"type":"host","name":"node-2"},{"type":"host","name":"node-3"}]}"#,
+        )
+        .unwrap();
+
+        let pools = parse_pools(Some(&osdmap), Some(&crush), &tree);
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].name, "testpool");
+        assert_eq!(pools[0].size, 4);
+        assert_eq!(pools[0].failure_domain, "host");
+        assert_eq!(pools[0].available_domains, 3);
+    }
+
+    #[test]
+    fn abnormal_pgs_keep_state_and_osd_mappings() {
+        let dump: Value = serde_json::from_str(
+            r#"{"pg_stats":[
+              {"pgid":"2.0","state":"active+clean","up":[0,1,2],"acting":[0,1,2]},
+              {"pgid":"2.1","state":"active+clean+scrubbing+deep","up":[1,2,0],"acting":[1,2,0]},
+              {"pgid":"2.2","state":"active+remapped+backfilling","up":[3,1,2],"acting":[0,1,2]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let pgs = parse_abnormal_pgs(Some(&dump));
+
+        assert_eq!(pgs.len(), 2);
+        assert_eq!(pgs[0].id, "2.1");
+        assert_eq!(pgs[0].acting, vec![1, 2, 0]);
+        assert_eq!(pgs[1].up, vec![3, 1, 2]);
     }
 
     #[test]
