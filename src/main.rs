@@ -120,6 +120,21 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn stacked_tab_switches_nodes_and_osd_before_other_panels() {
+        assert_eq!(next_panel(PanelFocus::Osds, 1, true), PanelFocus::Nodes);
+        assert_eq!(next_panel(PanelFocus::Nodes, -1, true), PanelFocus::Osds);
+        assert_eq!(next_panel(PanelFocus::Nodes, 1, true), PanelFocus::Insights);
+        assert_eq!(next_panel(PanelFocus::Osds, -1, true), PanelFocus::Logs);
+    }
+
+    #[test]
+    fn wide_tab_keeps_osds_beside_insights() {
+        assert_eq!(next_panel(PanelFocus::Osds, 1, false), PanelFocus::Insights);
+        assert_eq!(next_panel(PanelFocus::Osds, -1, false), PanelFocus::Nodes);
+        assert_eq!(next_panel(PanelFocus::Nodes, 1, false), PanelFocus::Osds);
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -387,6 +402,7 @@ fn run_live_tui(config_path: PathBuf, cfg: ResolvedConfig) -> Result<()> {
         rx,
         logs: Vec::new(),
         event_log_height: EVENT_LOG_DEFAULT_HEIGHT,
+        terminal_width: 80,
         terminal_height: 24,
         overview_offset: 0,
         insights_offset: 0,
@@ -480,6 +496,7 @@ fn run_replay_tui(file: PathBuf) -> Result<()> {
         rx,
         logs: vec![format!("replay loaded from {}", file.display())],
         event_log_height: EVENT_LOG_DEFAULT_HEIGHT,
+        terminal_width: 80,
         terminal_height: 24,
         overview_offset: 0,
         insights_offset: 0,
@@ -587,6 +604,7 @@ fn run_app(
         needs_redraw |= drain_worker_messages(&mut app);
 
         let size = terminal.size()?;
+        app.terminal_width = size.width;
         app.terminal_height = size.height;
         let size_supported = ui::terminal_size_supported(size.width, size.height);
         if size_supported && !live_started {
@@ -843,24 +861,43 @@ fn handle_panel_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn focus_next_panel(app: &mut App, delta: i32) {
-    let panels = focusable_panels();
-    let current = panels
-        .iter()
-        .position(|panel| *panel == app.focused_panel)
-        .unwrap_or(0) as i32;
-    let len = panels.len() as i32;
-    let next = (current + delta).rem_euclid(len) as usize;
-    app.focused_panel = panels[next];
+    app.focused_panel = next_panel(app.focused_panel, delta, overview_stacks_nodes_osds(app));
 }
 
-fn focusable_panels() -> &'static [PanelFocus] {
-    &[
-        PanelFocus::Osds,
-        PanelFocus::Insights,
-        PanelFocus::Trace,
-        PanelFocus::Logs,
-        PanelFocus::Nodes,
-    ]
+fn overview_stacks_nodes_osds(app: &App) -> bool {
+    app.terminal_width < ui::OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH
+}
+
+fn next_panel(current: PanelFocus, delta: i32, stacked: bool) -> PanelFocus {
+    let panels = focusable_panels(stacked);
+    let index = panels
+        .iter()
+        .position(|panel| *panel == current)
+        .unwrap_or(0) as i32;
+    let len = panels.len() as i32;
+    panels[(index + delta).rem_euclid(len) as usize]
+}
+
+fn focusable_panels(stacked: bool) -> &'static [PanelFocus] {
+    if stacked {
+        // Keep nodes and osd map adjacent so Tab switches the stacked tabs
+        // without walking through insights, trace, and the event log first.
+        &[
+            PanelFocus::Osds,
+            PanelFocus::Nodes,
+            PanelFocus::Insights,
+            PanelFocus::Trace,
+            PanelFocus::Logs,
+        ]
+    } else {
+        &[
+            PanelFocus::Osds,
+            PanelFocus::Insights,
+            PanelFocus::Trace,
+            PanelFocus::Logs,
+            PanelFocus::Nodes,
+        ]
+    }
 }
 
 fn scroll_focused_panel(app: &mut App, delta: isize) {
