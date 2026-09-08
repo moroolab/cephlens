@@ -21,6 +21,14 @@ Notable changes are documented here. The format follows
 - The compact OSD map prioritizes the complete Host value over secondary
   columns when horizontal space is limited.
 
+## [0.1.15] - 2026-09-08
+
+### Changed
+
+- When the overview is too narrow for nodes and the OSD map side by side, the
+  shared panel title shows both views as tabs. Tab then switches those views
+  before it leaves the overview.
+
 ## [0.1.9] - 2026-07-26
 
 ### Changed
@@ -170,7 +178,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/xtrusia/cephlens/compare/v0.1.14...v0.1.15
 [0.1.9]: https://github.com/xtrusia/cephlens/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xtrusia/cephlens/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/xtrusia/cephlens/compare/v0.1.6...v0.1.7

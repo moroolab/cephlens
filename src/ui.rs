@@ -32,7 +32,8 @@ const TEXT: Color = Color::Rgb(198, 208, 219);
 
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 20;
-const RECOMMENDED_TERMINAL_WIDTH: u16 = 110;
+pub(crate) const OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH: u16 = 110;
+const RECOMMENDED_TERMINAL_WIDTH: u16 = OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -447,9 +448,9 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        draw_nodes(frame, app, chunks[1]);
-        draw_osds(frame, app, chunks[2]);
-    } else if area.width >= 110 && area.height >= 8 {
+        draw_nodes(frame, app, chunks[1], false);
+        draw_osds(frame, app, chunks[2], false);
+    } else if area.width >= OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH && area.height >= 8 {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -459,34 +460,32 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        draw_nodes(frame, app, chunks[1]);
-        draw_osds(frame, app, chunks[2]);
+        draw_nodes(frame, app, chunks[1], false);
+        draw_osds(frame, app, chunks[2], false);
     } else if area.width >= 72 {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        if app.focused_panel == PanelFocus::Nodes {
-            draw_nodes(frame, app, chunks[1]);
-        } else {
-            draw_osds(frame, app, chunks[1]);
-        }
+        draw_stacked_nodes_osds(frame, app, chunks[1]);
     } else if area.height >= 12 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(7), Constraint::Min(5)])
             .split(area);
         draw_cluster(frame, app, chunks[0]);
-        if app.focused_panel == PanelFocus::Nodes {
-            draw_nodes(frame, app, chunks[1]);
-        } else {
-            draw_osds(frame, app, chunks[1]);
-        }
-    } else if app.focused_panel == PanelFocus::Nodes {
-        draw_nodes(frame, app, area);
+        draw_stacked_nodes_osds(frame, app, chunks[1]);
     } else {
-        draw_osds(frame, app, area);
+        draw_stacked_nodes_osds(frame, app, area);
+    }
+}
+
+fn draw_stacked_nodes_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.focused_panel == PanelFocus::Nodes {
+        draw_nodes(frame, app, area, true);
+    } else {
+        draw_osds(frame, app, area, true);
     }
 }
 
@@ -573,7 +572,10 @@ fn help_commands(app: &App) -> Vec<(&'static str, &'static str)> {
             ("o", "flow: order by ops or latency"),
             ("s", "flow: reverse the order"),
             ("x", "clear captured trace"),
-            ("Tab / Shift+Tab", "focus next / prev panel"),
+            (
+                "Tab / Shift+Tab",
+                "focus next / prev panel; nodes/osd tabs when stacked",
+            ),
             ("Up/Dn j/k", "scroll focused panel"),
             ("PgUp/PgDn", "scroll faster"),
             ("Home/End", "jump to start / end"),
@@ -1625,7 +1627,7 @@ fn osdtrace_glyph(app: &App, host: &str) -> (&'static str, Color) {
     }
 }
 
-fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
     let max_host_len = app.hosts.iter().map(|h| h.len()).max().unwrap_or(4).max(4);
     let host_width = if area.width >= 50 {
         max_host_len.max(9)
@@ -1653,14 +1655,18 @@ fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Row::new(["Host", "State", "T", "OSD", "CPU%", "MEM%", "IO%"])
                 .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
         )
-        .block(scroll_panel(
+        .block(panel_block(
             app,
             PanelFocus::Nodes,
-            "nodes",
-            total,
-            visible,
-            scroll,
-            false,
+            nodes_osd_panel_title(
+                app,
+                PanelFocus::Nodes,
+                "nodes",
+                total,
+                visible,
+                scroll,
+                tabbed,
+            ),
             resize_hint(app, PanelFocus::Nodes, area),
         )),
         area,
@@ -1726,7 +1732,7 @@ fn node_rows(app: &App, host_width: usize) -> Vec<Row<'static>> {
         .collect()
 }
 
-fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
     let osds = app
         .snapshot
         .as_ref()
@@ -1814,14 +1820,18 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header.style(Style::default().fg(MUTED).bold()))
         .style(Style::default().fg(TEXT))
-        .block(scroll_panel(
+        .block(panel_block(
             app,
             PanelFocus::Osds,
-            "osd map",
-            total,
-            visible,
-            scroll,
-            false,
+            nodes_osd_panel_title(
+                app,
+                PanelFocus::Osds,
+                "osd map",
+                total,
+                visible,
+                scroll,
+                tabbed,
+            ),
             resize_hint(app, PanelFocus::Osds, area),
         ))
         .row_highlight_style(Style::default().reversed());
@@ -1877,7 +1887,7 @@ fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn panel(title: &'static str) -> Block<'static> {
-    panel_with_style(title.to_owned(), MUTED)
+    panel_with_style(title, MUTED)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1891,11 +1901,27 @@ fn scroll_panel(
     from_bottom: bool,
     resize: Option<u16>,
 ) -> Block<'static> {
-    let focused = app.focused_panel == focus;
-    let marker = if focused { ">" } else { " " };
     let suffix = scroll_suffix(total, visible, scroll, from_bottom);
-    let border = if focused { WARN } else { MUTED };
-    let mut block = panel_with_style(format!(" {marker} {title}{suffix} "), border);
+    panel_block(
+        app,
+        focus,
+        labeled_panel_title(app, focus, title, &suffix),
+        resize,
+    )
+}
+
+fn panel_block(
+    app: &App,
+    focus: PanelFocus,
+    title: Line<'static>,
+    resize: Option<u16>,
+) -> Block<'static> {
+    let border = if app.focused_panel == focus {
+        WARN
+    } else {
+        MUTED
+    };
+    let mut block = panel_with_style(title, border);
     if let Some(rows) = resize {
         block = block.title_top(
             Line::from(Span::styled(
@@ -1906,6 +1932,57 @@ fn scroll_panel(
         );
     }
     block
+}
+
+fn labeled_panel_title(app: &App, focus: PanelFocus, title: &str, suffix: &str) -> Line<'static> {
+    let marker = if app.focused_panel == focus { ">" } else { " " };
+    Line::from(format!(" {marker} {title}{suffix} "))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nodes_osd_panel_title(
+    app: &App,
+    focus: PanelFocus,
+    title: &str,
+    total: usize,
+    visible: usize,
+    scroll: usize,
+    tabbed: bool,
+) -> Line<'static> {
+    let suffix = scroll_suffix(total, visible, scroll, false);
+    if tabbed {
+        nodes_osd_tab_title(app, focus, &suffix)
+    } else {
+        labeled_panel_title(app, focus, title, &suffix)
+    }
+}
+
+fn nodes_osd_tab_title(app: &App, active: PanelFocus, suffix: &str) -> Line<'static> {
+    let focused = app.focused_panel == active;
+    let mut spans = vec![
+        Span::raw(" "),
+        tab_label("nodes", active == PanelFocus::Nodes, focused),
+        Span::styled("│", Style::default().fg(MUTED)),
+        tab_label("osd map", active == PanelFocus::Osds, focused),
+    ];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix.to_owned(), Style::default().fg(MUTED)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+fn tab_label(label: &'static str, selected: bool, panel_focused: bool) -> Span<'static> {
+    let style = if selected && panel_focused {
+        Style::default()
+            .fg(WARN)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if selected {
+        Style::default().fg(TEXT).bold()
+    } else {
+        Style::default().fg(MUTED)
+    };
+    Span::styled(format!(" {label} "), style)
 }
 
 fn resize_hint(app: &App, focus: PanelFocus, area: Rect) -> Option<u16> {
@@ -1948,7 +2025,7 @@ fn table_visible_rows(area: Rect) -> usize {
     area.height.saturating_sub(3).max(1) as usize
 }
 
-fn panel_with_style(title: String, border: Color) -> Block<'static> {
+fn panel_with_style(title: impl Into<Line<'static>>, border: Color) -> Block<'static> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -2300,6 +2377,7 @@ mod tests {
             rx,
             logs: Vec::new(),
             event_log_height: 5,
+            terminal_width: 80,
             terminal_height: 24,
             overview_offset: 0,
             insights_offset: 0,
@@ -2370,7 +2448,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_osds(frame, &app, frame.area());
+                draw_osds(frame, &app, frame.area(), false);
             })
             .unwrap();
 
@@ -2404,7 +2482,7 @@ mod tests {
         let backend = TestBackend::new(90, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Focused on Osds -> shows osd map
+        // Focused on Osds -> shows osd map with both tab labels on the border
         app.focused_panel = PanelFocus::Osds;
         terminal
             .draw(|frame| {
@@ -2412,10 +2490,16 @@ mod tests {
             })
             .unwrap();
         let rendered_osds = buffer_text(terminal.backend().buffer());
-        assert!(rendered_osds.contains("osd map"));
-        assert!(!rendered_osds.contains("nodes"));
+        assert!(
+            rendered_osds
+                .lines()
+                .any(|line| line.contains("nodes") && line.contains("osd map")),
+            "stacked overview should show both tab labels on the panel title"
+        );
+        assert!(rendered_osds.contains("osd.0"));
+        assert!(!rendered_osds.contains("CPU%"));
 
-        // Focused on Nodes -> shows nodes
+        // Focused on Nodes -> shows nodes, still with both tab labels
         app.focused_panel = PanelFocus::Nodes;
         terminal
             .draw(|frame| {
@@ -2423,8 +2507,14 @@ mod tests {
             })
             .unwrap();
         let rendered_nodes = buffer_text(terminal.backend().buffer());
-        assert!(rendered_nodes.contains("nodes"));
-        assert!(!rendered_nodes.contains("osd map"));
+        assert!(
+            rendered_nodes
+                .lines()
+                .any(|line| line.contains("nodes") && line.contains("osd map")),
+            "stacked overview should keep both tab labels when showing nodes"
+        );
+        assert!(rendered_nodes.contains("CPU%"));
+        assert!(!rendered_nodes.contains("osd.0"));
     }
 
     #[test]

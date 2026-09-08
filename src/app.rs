@@ -172,6 +172,7 @@ pub(crate) struct App {
     pub(crate) rx: Receiver<WorkerMsg>,
     pub(crate) logs: Vec<String>,
     pub(crate) event_log_height: u16,
+    pub(crate) terminal_width: u16,
     pub(crate) terminal_height: u16,
     pub(crate) overview_offset: i16,
     pub(crate) insights_offset: i16,
