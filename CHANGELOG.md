@@ -21,6 +21,21 @@ Notable changes are documented here. The format follows
 - The compact OSD map prioritizes the complete Host value over secondary
   columns when horizontal space is limited.
 
+## [0.1.16] - 2026-09-11
+
+### Changed
+
+- The header is a single borderless row that now carries the cluster vitals
+  (health, OSD up/in, IO, data, PG states, mon/mgr). The separate vitals panel
+  is gone, so nodes and the OSD map sit side by side from 84 columns and the
+  dashboard gains four rows for trace and log data.
+- The header OSD count includes the total (`up/in/total`) so an OSD that is
+  down and out is still visible, and the SSH stream status now outranks the
+  profile and admin host when the row runs out of space.
+- The compact OSD map keeps the `Commit` latency column, and the compact trace
+  graph shows `Store` latency in place of the PG count, so a slow device can be
+  separated from a busy OSD queue on narrow terminals.
+
 ## [0.1.15] - 2026-09-08
 
 ### Changed
@@ -178,7 +193,8 @@ Initial release.
 - Cross-platform controller (Linux, macOS, Windows) with cargo-dist release
   archives that bundle the cephtrace tracers.
 
-[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/xtrusia/cephlens/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/xtrusia/cephlens/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/xtrusia/cephlens/compare/v0.1.14...v0.1.15
 [0.1.9]: https://github.com/xtrusia/cephlens/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/xtrusia/cephlens/compare/v0.1.7...v0.1.8

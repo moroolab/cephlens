@@ -32,8 +32,13 @@ const TEXT: Color = Color::Rgb(198, 208, 219);
 
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 20;
-pub(crate) const OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH: u16 = 110;
-const RECOMMENDED_TERMINAL_WIDTH: u16 = OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH;
+// Nodes need 40 columns before ratatui squeezes the host column, and the
+// compact OSD map needs 44 for OSD, host, and state.
+pub(crate) const OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH: u16 = 84;
+// Seven node columns total 36 cells and their six gaps add 6, so that border
+// needs 44; the full OSD table starts fitting from 60.
+const OVERVIEW_FULL_WIDTH: u16 = 104;
+const RECOMMENDED_TERMINAL_WIDTH: u16 = OVERVIEW_FULL_WIDTH;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -46,7 +51,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(log_height),
             Constraint::Length(1),
@@ -229,106 +234,168 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// One status line without a border. Segments are ordered by how often an
+/// operator needs them; trailing ones drop first when the terminal is narrow.
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let mode = match &app.mode {
-        Mode::Live => "LIVE",
-        Mode::Config => "CONFIG",
-        Mode::Replay { index, snapshots } => {
-            return frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(" cephlens ", Style::default().fg(ACCENT).bold()),
-                    Span::styled("REPLAY ", Style::default().fg(BLUE).bold()),
-                    Span::styled(
-                        format!("snapshot {}/{}", index + 1, snapshots.len()),
-                        Style::default().fg(WARN),
-                    ),
-                    Span::styled("  left/right move  q quit", Style::default().fg(MUTED)),
-                ]))
-                .block(panel(" replay deck ")),
-                area,
-            );
-        }
+    frame.render_widget(Paragraph::new(header_line(app, area.width)), area);
+}
+
+fn header_line(app: &App, width: u16) -> Line<'static> {
+    let cluster = app.snapshot.as_ref().map(|snapshot| &snapshot.cluster);
+    let health = cluster
+        .map(|cluster| cluster.health.as_str())
+        .unwrap_or("warming up");
+    let (mode, mode_detail) = match &app.mode {
+        Mode::Live => ("LIVE", None),
+        Mode::Config => ("CONFIG", None),
+        Mode::Replay { index, snapshots } => (
+            "REPLAY",
+            Some(format!("snapshot {}/{}", index + 1, snapshots.len())),
+        ),
     };
 
-    let session = app
-        .session_path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let status = if live_streams_active(app) {
-        let (live, total) = stream_counts(app);
-        if total == 0 {
-            "starting".to_owned()
-        } else if live == total {
-            format!("streaming {live}/{total}")
-        } else {
-            format!("reconnecting {live}/{total}")
-        }
-    } else {
-        "idle".to_owned()
-    };
-    let health = app
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.cluster.health.as_str())
-        .unwrap_or("warming up");
-    let osd = app
-        .snapshot
-        .as_ref()
-        .map(|snapshot| {
-            format!(
-                "{}/{} up/in",
-                snapshot.cluster.osds_up, snapshot.cluster.osds_in
-            )
-        })
-        .unwrap_or_else(|| "-/- up/in".to_owned());
-    let io = app
-        .snapshot
-        .as_ref()
-        .map(|snapshot| {
-            format!(
-                "rd {} {}/s  wr {} {}/s",
-                snapshot.cluster.read_ops_sec,
-                format_bytes(snapshot.cluster.read_bytes_sec),
-                snapshot.cluster.write_ops_sec,
-                format_bytes(snapshot.cluster.write_bytes_sec)
-            )
-        })
-        .unwrap_or_else(|| "rd 0 0 B/s  wr 0 0 B/s".to_owned());
-    let mut spans = vec![
+    let mut lead = vec![
         Span::styled(
             format!(" v{} ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(ACCENT).bold(),
         ),
         Span::styled(mode, Style::default().fg(BLUE).bold()),
-        Span::raw("  "),
-        pill(health, health_color(health)),
-        Span::styled(format!("  osd {osd}"), Style::default().fg(TEXT)),
-        Span::styled(format!("  {io}"), Style::default().fg(TEXT)),
     ];
-    if area.width >= 110 {
-        spans.extend([
-            Span::styled("  profile=", Style::default().fg(MUTED)),
-            Span::styled(app.profile.clone(), Style::default().fg(OK)),
-            Span::styled("  admin=", Style::default().fg(MUTED)),
-            Span::styled(app.admin_host.clone(), Style::default().fg(OK)),
-        ]);
+    if let Some(detail) = mode_detail {
+        lead.push(Span::styled(
+            format!(" {detail}"),
+            Style::default().fg(WARN),
+        ));
     }
-    if area.width >= 132 {
-        spans.extend([
-            Span::styled("  status=", Style::default().fg(MUTED)),
-            Span::styled(status, Style::default().fg(WARN)),
-        ]);
+    lead.push(Span::raw("  "));
+    lead.push(pill(health, health_color(health)));
+
+    let mut segments = vec![
+        lead,
+        header_kv("osd", osd_label(cluster), TEXT),
+        vec![Span::styled(
+            format!("  {}", io_label(cluster)),
+            Style::default().fg(TEXT),
+        )],
+        header_kv("data", data_label(cluster), TEXT),
+        header_kv("pg", pg_label(cluster), TEXT),
+    ];
+    if matches!(app.mode, Mode::Replay { .. }) {
+        segments.push(header_kv("mon/mgr", mon_label(cluster), TEXT));
+        segments.push(vec![Span::styled(
+            "  left/right move  q quit",
+            Style::default().fg(MUTED),
+        )]);
+    } else {
+        // Stream state comes before the static profile facts: when SSH is
+        // reconnecting, every other value on screen is stale.
+        segments.push(header_kv("status", stream_status_label(app), WARN));
+        segments.push(header_kv("mon/mgr", mon_label(cluster), TEXT));
+        segments.push(header_kv("profile", app.profile.clone(), OK));
+        segments.push(header_kv("admin", app.admin_host.clone(), OK));
+        if let Some(session) = app
+            .session_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+        {
+            segments.push(header_kv("session", short(&session, 20), MUTED));
+        }
     }
-    if area.width >= 168 && !session.is_empty() {
-        spans.extend([
-            Span::styled("  session=", Style::default().fg(MUTED)),
-            Span::styled(short(&session, 20), Style::default().fg(MUTED)),
-        ]);
+    fit_segments(segments, width as usize)
+}
+
+fn header_kv(key: &'static str, value: String, color: Color) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!("  {key} "), Style::default().fg(MUTED)),
+        Span::styled(value, Style::default().fg(color)),
+    ]
+}
+
+/// Keeps the leading segment and appends the rest in order until the next one
+/// would overflow the row.
+fn fit_segments(segments: Vec<Vec<Span<'static>>>, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (index, segment) in segments.into_iter().enumerate() {
+        let segment_width = segment.iter().map(Span::width).sum::<usize>();
+        if index > 0 && used + segment_width > width {
+            break;
+        }
+        used += segment_width;
+        spans.extend(segment);
     }
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line).block(panel(" cephlens ")), area);
+    Line::from(spans)
+}
+
+/// Includes the total so an OSD that is both down and out still shows up as a
+/// gap; up/in alone reads as healthy once the cluster has marked it out.
+fn osd_label(cluster: Option<&ClusterSummary>) -> String {
+    cluster
+        .map(|c| format!("{}/{}/{} up/in/total", c.osds_up, c.osds_in, c.osds_total))
+        .unwrap_or_else(|| "-/-/- up/in/total".to_owned())
+}
+
+fn io_label(cluster: Option<&ClusterSummary>) -> String {
+    cluster
+        .map(|c| {
+            format!(
+                "rd {} {}/s  wr {} {}/s",
+                c.read_ops_sec,
+                format_bytes(c.read_bytes_sec),
+                c.write_ops_sec,
+                format_bytes(c.write_bytes_sec)
+            )
+        })
+        .unwrap_or_else(|| "rd 0 0 B/s  wr 0 0 B/s".to_owned())
+}
+
+fn data_label(cluster: Option<&ClusterSummary>) -> String {
+    cluster
+        .map(|c| {
+            format!(
+                "{} / {}",
+                format_compact_bytes(c.bytes_used),
+                format_compact_bytes(c.bytes_total)
+            )
+        })
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+/// The first PG state plus a count of the others, so a degraded cluster still
+/// shows that more states exist without spending a row per state.
+fn pg_label(cluster: Option<&ClusterSummary>) -> String {
+    let Some(cluster) = cluster else {
+        return "-".to_owned();
+    };
+    let mut states = cluster.pg_states.split(", ").filter(|s| !s.is_empty());
+    let Some(first) = states.next() else {
+        return "-".to_owned();
+    };
+    match states.count() {
+        0 => first.to_owned(),
+        rest => format!("{first} +{rest}"),
+    }
+}
+
+fn mon_label(cluster: Option<&ClusterSummary>) -> String {
+    cluster
+        .map(|c| format!("{} / +{}", c.mon_count, c.mgr_standbys))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn stream_status_label(app: &App) -> String {
+    if !live_streams_active(app) {
+        return "idle".to_owned();
+    }
+    let (live, total) = stream_counts(app);
+    if total == 0 {
+        "starting".to_owned()
+    } else if live == total {
+        format!("streaming {live}/{total}")
+    } else {
+        format!("reconnecting {live}/{total}")
+    }
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -435,50 +502,20 @@ fn clamp_overview_height(base: u16, offset: i16, total: u16, insight: u16, trace
 }
 
 fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.width >= 142 && area.height >= 8 {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(34),
-                // Seven columns total 36 cells and their six gaps add 6, so the
-                // border needs 44. The three panel minimum stays under the gate
-                // below.
-                Constraint::Length(44),
-                Constraint::Min(60),
-            ])
-            .split(area);
-        draw_cluster(frame, app, chunks[0]);
-        draw_nodes(frame, app, chunks[1], false);
-        draw_osds(frame, app, chunks[2], false);
-    } else if area.width >= OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH && area.height >= 8 {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(28),
-                Constraint::Length(40),
-                Constraint::Min(38),
-            ])
-            .split(area);
-        draw_cluster(frame, app, chunks[0]);
-        draw_nodes(frame, app, chunks[1], false);
-        draw_osds(frame, app, chunks[2], false);
-    } else if area.width >= 72 {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-            .split(area);
-        draw_cluster(frame, app, chunks[0]);
-        draw_stacked_nodes_osds(frame, app, chunks[1]);
-    } else if area.height >= 12 {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(5)])
-            .split(area);
-        draw_cluster(frame, app, chunks[0]);
-        draw_stacked_nodes_osds(frame, app, chunks[1]);
+    let nodes_width = if area.width >= OVERVIEW_FULL_WIDTH {
+        44
+    } else if area.width >= OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH {
+        40
     } else {
         draw_stacked_nodes_osds(frame, app, area);
-    }
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(nodes_width), Constraint::Min(44)])
+        .split(area);
+    draw_nodes(frame, app, chunks[0], false);
+    draw_osds(frame, app, chunks[1], false);
 }
 
 fn draw_stacked_nodes_osds(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -891,7 +928,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
-                Cell::from("0").style(Style::default().fg(MUTED)),
+                Cell::from("-"),
                 Cell::from("-"),
                 Cell::from(hint).style(Style::default().fg(MUTED)),
             ])]
@@ -919,7 +956,7 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .map(|row| {
                 let max_color = latency_color(row.max_us);
                 let graph_width = if compact {
-                    area.width.saturating_sub(71) as usize
+                    area.width.saturating_sub(73) as usize
                 } else {
                     area.width.saturating_sub(113) as usize
                 }
@@ -934,7 +971,9 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Cell::from(format_latency_us(row.queue_max_us)),
                         Cell::from(format_latency_us(row.recv_max_us)),
                         Cell::from(format_latency_us(row.peer_max_us)),
-                        Cell::from(row.pg_count.to_string()).style(trace_ops_style(row.ops)),
+                        // Store is the disk axis; without it the compact view
+                        // cannot separate a slow device from a busy OSD queue.
+                        Cell::from(format_latency_us(row.store_max_us)),
                         Cell::from(short(&row.hot_pg, 15)).style(Style::default().fg(BLUE)),
                         Cell::from(graph).style(Style::default().fg(max_color)),
                     ])
@@ -976,12 +1015,12 @@ fn draw_trace_events(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(7),
-                Constraint::Length(5),
+                Constraint::Length(7),
                 Constraint::Length(15),
                 Constraint::Min(12),
             ],
             Row::new([
-                "OSD", "Ops", "Max", "Queue", "Recv", "Peer", "PGs", "Busy PG", "Max/2s",
+                "OSD", "Ops", "Max", "Queue", "Recv", "Peer", "Store", "Busy PG", "Max/2s",
             ]),
         )
     } else {
@@ -1559,65 +1598,6 @@ fn config_row(
     .style(style)
 }
 
-fn cluster_lines(c: &ClusterSummary) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            label("health"),
-            pill(&c.health, health_color(&c.health)),
-        ]),
-        kv_line("fsid", short(&c.fsid, 8), BLUE),
-        kv_line(
-            "mon/mgr",
-            format!("{} / +{}", c.mon_count, c.mgr_standbys),
-            TEXT,
-        ),
-        kv_line("osd", format!("{}/{} up/in", c.osds_up, c.osds_in), OK),
-        Line::from(vec![
-            label("data"),
-            Span::styled(
-                format!(
-                    "{} / {}",
-                    format_compact_bytes(c.bytes_used),
-                    format_compact_bytes(c.bytes_total)
-                ),
-                Style::default().fg(TEXT),
-            ),
-        ]),
-    ];
-
-    let mut pg_iter = c.pg_states.split(", ").filter(|s| !s.is_empty());
-    if let Some(first) = pg_iter.next() {
-        lines.push(kv_line("pg", first, TEXT));
-        for rest in pg_iter {
-            lines.push(kv_line("", rest, TEXT));
-        }
-    } else {
-        lines.push(kv_line("pg", "-", MUTED));
-    }
-
-    lines
-}
-
-fn draw_cluster(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(snapshot) = &app.snapshot else {
-        frame.render_widget(
-            Paragraph::new("Waiting for first snapshot...")
-                .style(Style::default().fg(MUTED))
-                .block(panel(" vitals ")),
-            area,
-        );
-        return;
-    };
-
-    let lines = cluster_lines(&snapshot.cluster);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(TEXT))
-            .block(panel(" vitals ")),
-        area,
-    );
-}
-
 fn osdtrace_glyph(app: &App, host: &str) -> (&'static str, Color) {
     match app.trace_targets.iter().find(|target| target.host == host) {
         None => ("·", MUTED),
@@ -1764,10 +1744,14 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
             BLUE,
         );
         if compact {
+            // Commit latency stays in the compact set: it is the first value
+            // an operator checks when hunting a slow OSD.
             Row::new(vec![
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
                 Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
                 Cell::from(map_state).style(status_style),
+                Cell::from(latency_ms_label(osd.commit_latency_ms))
+                    .style(Style::default().fg(latency_color(osd.commit_latency_ms * 1_000))),
             ])
         } else {
             Row::new(vec![
@@ -1793,8 +1777,9 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
                 Constraint::Length(7),
                 Constraint::Min(host_width),
                 Constraint::Length(8),
+                Constraint::Length(7),
             ],
-            Row::new(vec!["OSD", "Host", "State"]),
+            Row::new(vec!["OSD", "Host", "State", "Commit"]),
         )
     } else {
         (
@@ -2110,13 +2095,6 @@ fn label(text: &'static str) -> Span<'static> {
     Span::styled(format!("{text:<8}"), Style::default().fg(MUTED))
 }
 
-fn kv_line(label_text: &'static str, value: impl Into<String>, color: Color) -> Line<'static> {
-    Line::from(vec![
-        label(label_text),
-        Span::styled(value.into(), Style::default().fg(color)),
-    ])
-}
-
 fn bar(ratio: f64, width: usize, _color: Color) -> String {
     let ratio = ratio.clamp(0.0, 1.0);
     let filled = (ratio * width as f64).round() as usize;
@@ -2287,49 +2265,75 @@ mod tests {
         assert_eq!(rendered.matches('→').count(), 1);
     }
 
-    #[test]
-    fn cluster_lines_splits_multiple_pg_states() {
-        let summary = ClusterSummary {
-            health: "HEALTH_OK".to_owned(),
-            pg_states: "128 active+clean, 32 active+undersized".to_owned(),
-            ..ClusterSummary::default()
-        };
-        let lines = cluster_lines(&summary);
-        assert_eq!(lines.len(), 7);
-
-        let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(lines).block(panel(" vitals ")), frame.area());
-            })
-            .unwrap();
-
-        let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("pg      128 active+clean"));
-        assert!(rendered.contains("        32 active+undersized"));
+    fn snapshot_with_cluster(cluster: ClusterSummary) -> Snapshot {
+        Snapshot {
+            captured_at: chrono::Utc::now(),
+            profile: "test".to_owned(),
+            admin_host: "host1".to_owned(),
+            hosts: vec!["host1".to_owned()],
+            trace_window_secs: 10,
+            cluster,
+            nodes: Vec::new(),
+            osds: Vec::new(),
+            pools: Vec::new(),
+            abnormal_pgs: Vec::new(),
+        }
     }
 
     #[test]
-    fn cluster_lines_handles_empty_pg_state() {
-        let summary = ClusterSummary {
+    fn header_folds_cluster_vitals_into_one_row() {
+        let mut app = test_app();
+        app.snapshot = Some(snapshot_with_cluster(ClusterSummary {
+            health: "HEALTH_OK".to_owned(),
+            osds_up: 3,
+            osds_in: 3,
+            osds_total: 4,
+            mon_count: 3,
+            mgr_standbys: 1,
+            bytes_used: 2 * 1024 * 1024 * 1024,
+            bytes_total: 20 * 1024 * 1024 * 1024,
+            pg_states: "128 active+clean, 32 active+undersized".to_owned(),
+            ..ClusterSummary::default()
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_header(frame, &app, frame.area()))
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("HEALTH_OK"));
+        assert!(rendered.contains("osd 3/3/4 up/in/total"));
+        // Live mode with no streams yet reports "starting"; it must come
+        // before the profile so a stalled stream is not the first thing cut.
+        let status_at = rendered.find("status starting").unwrap();
+        let profile_at = rendered.find("profile test").unwrap();
+        assert!(status_at < profile_at);
+        assert!(rendered.contains("data 2G / 20G"));
+        assert!(rendered.contains("pg 128 active+clean +1"));
+        assert!(rendered.contains("mon/mgr 3 / +1"));
+        assert!(rendered.contains("profile test"));
+    }
+
+    #[test]
+    fn header_drops_trailing_segments_instead_of_wrapping() {
+        let mut app = test_app();
+        app.snapshot = Some(snapshot_with_cluster(ClusterSummary {
             health: "HEALTH_OK".to_owned(),
             pg_states: String::new(),
             ..ClusterSummary::default()
-        };
-        let lines = cluster_lines(&summary);
-        assert_eq!(lines.len(), 6);
+        }));
 
-        let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(lines).block(panel(" vitals ")), frame.area());
-            })
+            .draw(|frame| draw_header(frame, &app, frame.area()))
             .unwrap();
-
         let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("pg      -"));
+        assert!(rendered.contains("HEALTH_OK"));
+        assert!(rendered.contains("osd 0/0/0 up/in/total"));
+        assert!(!rendered.contains("profile"));
+
+        assert_eq!(pg_label(app.snapshot.as_ref().map(|s| &s.cluster)), "-");
+        assert_eq!(pg_label(None), "-");
     }
 
     #[test]
@@ -2438,6 +2442,7 @@ mod tests {
                 host: "storage-node-production-01.ceph.example.com".to_owned(),
                 status: "up".to_owned(),
                 reweight: 1.0,
+                commit_latency_ms: 37,
                 ..OsdSummary::default()
             }],
             pools: Vec::new(),
@@ -2454,6 +2459,10 @@ mod tests {
 
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("storage-node-production-01.ceph.example.com"));
+        // The compact set keeps commit latency next to the state column.
+        assert!(rendered.contains("Commit"));
+        assert!(rendered.contains("37ms"));
+        assert!(!rendered.contains("Apply"));
     }
 
     #[test]
@@ -2478,8 +2487,8 @@ mod tests {
             abnormal_pgs: Vec::new(),
         });
 
-        // 90 cols wide is < 110 (2-panel mode)
-        let backend = TestBackend::new(90, 10);
+        // 82 cols is under OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH, so the two tables stack
+        let backend = TestBackend::new(82, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Focused on Osds -> shows osd map with both tab labels on the border
@@ -2518,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_medium_displays_all_three_panels() {
+    fn overview_side_by_side_shows_both_tables() {
         let mut app = test_app();
         app.snapshot = Some(Snapshot {
             captured_at: chrono::Utc::now(),
@@ -2539,8 +2548,9 @@ mod tests {
             abnormal_pgs: Vec::new(),
         });
 
-        // 115 cols wide is >= 110 (3-panel mode)
-        let backend = TestBackend::new(115, 10);
+        // 90 cols clears OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH, so nodes and the OSD
+        // map render as two separate panels with their own tables.
+        let backend = TestBackend::new(90, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
@@ -2549,8 +2559,10 @@ mod tests {
             })
             .unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("vitals"));
         assert!(rendered.contains("nodes"));
         assert!(rendered.contains("osd map"));
+        assert!(rendered.contains("CPU%"));
+        assert!(rendered.contains("osd.0"));
+        assert!(!rendered.contains("vitals"));
     }
 }
