@@ -349,9 +349,11 @@ wait, and BlueStore latency. The kfstrace and radostrace views run on
 operations.
 `trace_window_secs` controls the recent osdtrace aggregation window in both the
 live TUI and generated reports.
-The TUI requires a terminal of at least 100 columns by 32 rows. A 142 by 32
+The TUI requires a terminal of at least 80 columns by 20 rows. A 104 by 32
 terminal is recommended for the full dashboard. Live SSH streams and automatic
-tracing do not start until the terminal reaches the minimum size.
+tracing do not start until the terminal reaches the minimum size. The header is
+a single row that shows health, OSD up/in, IO rate, data usage, PG states, and
+mon/mgr counts; narrower terminals drop the trailing items first.
 On wide terminals the trace panel appears on the right; on tall terminals it
 appears below the dashboard.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
