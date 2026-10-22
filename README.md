@@ -360,9 +360,13 @@ running or has captured data. Idle tracing uses a compact start hint.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
 host for node readiness. `refresh_secs` is the pause between ticks, so the
 period an operator sees is that pause plus the time the remote queries take. On
-each cluster tick, `ceph -s`, `ceph osd dump`, and `ceph pg dump pgs` refresh
-while one of `ceph osd tree`, `ceph osd df`, `ceph osd perf`, and `ceph osd
-crush rule dump` rotates in. Static node facts are collected when the stream
+each cluster tick, `ceph -s` refreshes independently of the detail queries, so
+the first health summary does not wait for the OSD map or PG dump. OSD performance
+uses the same interval; OSD usage, the OSD map, and PG details use at least five
+seconds or twice `refresh_secs`. The tree and CRUSH rules use at least 30 seconds.
+Each detail query retains its last successful result while refreshing, and
+unavailable initial details remain empty until their first result arrives.
+Static node facts are collected when the stream
 connects, OSD processes are scanned no more often than every five seconds, and
 CPU, memory, and pressure values follow `refresh_secs`. That OSD scan also
 reads any systemd `IOWriteBandwidthMax` applied to an OSD service. The node

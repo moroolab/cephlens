@@ -6,9 +6,8 @@ use crate::{
     util::{ptr_f64, ptr_str, ptr_u64},
 };
 
-// Scratch space for one stream's admin query results. It follows the runner
-// convention of living under ~/.cache/cephlens and is removed when the remote
-// shell exits, which happens as soon as the controller closes the connection.
+// Each detail query writes its latest successful result atomically. Only the
+// foreground status loop emits JSON, so concurrent updates cannot interleave it.
 pub(crate) const CLUSTER_STREAM_SETUP: &str = r#"dir="$HOME/.cache/cephlens/status-$$"
 mkdir -p "$dir"
 for stale in "$HOME"/.cache/cephlens/status-*; do
@@ -17,20 +16,33 @@ for stale in "$HOME"/.cache/cephlens/status-*; do
   case "$pid" in ''|*[!0-9]*) continue ;; esac
   [ "$pid" = "$$" ] || kill -0 "$pid" 2>/dev/null || rm -rf "$stale"
 done
-cleanup() { rm -rf "$dir"; }
-trap 'cleanup; exit 0' INT TERM HUP PIPE
-trap cleanup EXIT"#;
-
-// Prime every cache before the first payload. Steady-state refreshes keep the
-// changing PG and OSD-map evidence current and rotate the heavier detail queries.
-pub(crate) const CLUSTER_STREAM_TICK: &str = r#"  sudo -n ceph -s --format json >"$dir/status" 2>/dev/null &
-  sudo -n ceph osd tree --format json >"$dir/tree" 2>/dev/null &
-  sudo -n ceph osd df --format json >"$dir/df" 2>/dev/null &
-  sudo -n ceph osd perf --format json >"$dir/perf" 2>/dev/null &
-  sudo -n ceph osd dump --format json >"$dir/osdmap" 2>/dev/null &
-  sudo -n ceph osd crush rule dump --format json >"$dir/crush" 2>/dev/null &
-  sudo -n ceph pg dump pgs --format json >"$dir/pgs" 2>/dev/null &
-  wait"#;
+workers=""
+cleanup() {
+  trap - INT TERM HUP PIPE EXIT
+  for worker in $workers; do kill "$worker" 2>/dev/null || true; done
+  wait
+  rm -rf "$dir"
+}
+trap 'exit 0' INT TERM HUP PIPE
+trap cleanup EXIT
+refresh_detail() {
+  name=$1
+  interval=$2
+  shift 2
+  child=""
+  trap - EXIT
+  trap '[ -z "$child" ] || kill "$child" 2>/dev/null || true; exit 0' INT TERM HUP PIPE
+  while true; do
+    sudo -n ceph "$@" --format json >"$dir/$name.next" 2>/dev/null &
+    child=$!
+    if wait "$child" && [ -s "$dir/$name.next" ]; then
+      mv "$dir/$name.next" "$dir/$name"
+    fi
+    sleep "$interval" &
+    child=$!
+    wait "$child" || exit 0
+  done
+}"#;
 
 const CLUSTER_STREAM_EMIT: &str = r#"  status=$(tr -d '\n' <"$dir/status")
   tree=$(tr -d '\n' <"$dir/tree")
@@ -39,50 +51,39 @@ const CLUSTER_STREAM_EMIT: &str = r#"  status=$(tr -d '\n' <"$dir/status")
   osdmap=$(tr -d '\n' <"$dir/osdmap")
   crush=$(tr -d '\n' <"$dir/crush")
   pgs=$(tr -d '\n' <"$dir/pgs")
-  [ -n "$perf" ] || perf=null
-  [ -n "$osdmap" ] || osdmap=null
-  [ -n "$crush" ] || crush=null
-  [ -n "$pgs" ] || pgs=null
-  if [ -n "$status" ] && [ -n "$tree" ] && [ -n "$df" ]; then
+  if [ -n "$status" ]; then
     printf '{"type":"status","status":%s,"tree":%s,"df":%s,"perf":%s,"osdmap":%s,"crush":%s,"pgs":%s}\n' "$status" "$tree" "$df" "$perf" "$osdmap" "$crush" "$pgs"
   else
-    printf '{"type":"error","message":"ceph command failed"}\n'
+    printf '{"type":"error","message":"ceph status command failed"}\n'
   fi"#;
 
-fn cluster_stream_refresh_tick() -> String {
-    format!(
-        r#"  (sudo -n ceph -s --format json >"$dir/status.next" 2>/dev/null && mv "$dir/status.next" "$dir/status" || : >"$dir/status") &
-  (sudo -n ceph osd dump --format json >"$dir/osdmap.next" 2>/dev/null && mv "$dir/osdmap.next" "$dir/osdmap" || : >"$dir/osdmap") &
-  (sudo -n ceph pg dump pgs --format json >"$dir/pgs.next" 2>/dev/null && mv "$dir/pgs.next" "$dir/pgs" || : >"$dir/pgs") &
-  case "$phase" in
-    0) (sudo -n ceph osd tree --format json >"$dir/tree.next" 2>/dev/null && mv "$dir/tree.next" "$dir/tree" || : >"$dir/tree") ;;
-    1) (sudo -n ceph osd df --format json >"$dir/df.next" 2>/dev/null && mv "$dir/df.next" "$dir/df" || : >"$dir/df") ;;
-    2) (sudo -n ceph osd perf --format json >"$dir/perf.next" 2>/dev/null && mv "$dir/perf.next" "$dir/perf" || : >"$dir/perf") ;;
-    3) (sudo -n ceph osd crush rule dump --format json >"$dir/crush.next" 2>/dev/null && mv "$dir/crush.next" "$dir/crush" || : >"$dir/crush") ;;
-  esac &
-  wait
-  phase=$(( (phase + 1) % 4 ))
-{emit}"#,
-        emit = CLUSTER_STREAM_EMIT,
-    )
-}
-
 pub(crate) fn cluster_stream_command(interval_secs: u64) -> String {
-    let refresh_tick = cluster_stream_refresh_tick();
+    let interval_secs = interval_secs.max(1);
+    let map_interval = (interval_secs * 2).max(5);
+    let static_interval = interval_secs.max(30);
     format!(
         r#"
 {setup}
-{initial_tick}
-{emit}
-  sleep {interval_secs}
-phase=0
+for name in tree df perf osdmap crush pgs; do printf 'null' >"$dir/$name"; done
+refresh_detail tree {static_interval} osd tree &
+workers="$workers $!"
+refresh_detail df {map_interval} osd df &
+workers="$workers $!"
+refresh_detail perf {interval_secs} osd perf &
+workers="$workers $!"
+refresh_detail osdmap {map_interval} osd dump &
+workers="$workers $!"
+refresh_detail crush {static_interval} osd crush rule dump &
+workers="$workers $!"
+refresh_detail pgs {map_interval} pg dump pgs &
+workers="$workers $!"
 while true; do
-{refresh_tick}
+  sudo -n ceph -s --format json >"$dir/status" 2>/dev/null || : >"$dir/status"
+{emit}
   sleep {interval_secs}
 done
 "#,
         setup = CLUSTER_STREAM_SETUP,
-        initial_tick = CLUSTER_STREAM_TICK,
         emit = CLUSTER_STREAM_EMIT,
     )
 }
@@ -310,12 +311,10 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     const QUERY_SECS: f64 = 0.4;
 
-    /// Builds a HOME with `sudo` and `ceph` stubs on PATH so the cluster stream
-    /// can run without a cluster. Each stubbed query sleeps `QUERY_SECS`.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn stub_admin_host(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -329,7 +328,13 @@ mod tests {
             ),
             (
                 "ceph",
-                format!("#!/bin/sh\nsleep {QUERY_SECS}\necho '{{\"stub\":true}}'\n"),
+                format!(
+                    r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/queries"
+if [ "$1" = -s ]; then sleep 0.05; else sleep "${{DETAIL_QUERY_SECS:-{QUERY_SECS}}}"; fi
+echo '{{"stub":true}}'
+"#
+                ),
             ),
         ] {
             let path = bin.join(name);
@@ -339,96 +344,82 @@ mod tests {
         (root, bin)
     }
 
-    // A sequential tick costs seven stubbed sleeps and a concurrent one costs a
-    // single sleep. The bound sits between them with room on both sides so
-    // ordinary scheduling noise cannot flip the result.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
-    fn cluster_stream_tick_runs_its_queries_concurrently() {
-        use std::{fs, process::Command, time::Instant};
-
-        let (root, bin) = stub_admin_host("tick");
-
-        let script =
-            format!("{CLUSTER_STREAM_SETUP}\n{CLUSTER_STREAM_TICK}\n{CLUSTER_STREAM_EMIT}\n");
-        let started = Instant::now();
-        let output = Command::new("sh")
+    fn cluster_stream_emits_status_before_slow_details() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader},
+            process::{Command, Stdio},
+            time::Instant,
+        };
+        let (root, bin) = stub_admin_host("fast-status");
+        let mut child = Command::new("sh")
             .arg("-c")
-            .arg(&script)
+            .arg(format!("{{ {} }} | head -1", cluster_stream_command(1)))
             .env("PATH", format!("{}:{}", bin.display(), env!("PATH")))
             .env("HOME", &root)
-            .output()
-            .expect("sh should be available");
-        let elapsed = started.elapsed().as_secs_f64();
-        let payload = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            .env("DETAIL_QUERY_SECS", "2")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let mut payload = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut payload)
+            .unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        let status = child.wait().unwrap();
         let _ = fs::remove_dir_all(&root);
-
-        let value: Value = serde_json::from_str(&payload).expect("tick emits one JSON object");
-        assert_eq!(
-            value.pointer("/type").and_then(Value::as_str),
-            Some("status")
-        );
-        assert!(value.pointer("/status").is_some());
-        assert!(value.pointer("/tree").is_some());
-        assert!(value.pointer("/df").is_some());
-        assert!(value.pointer("/osdmap").is_some());
-        assert!(value.pointer("/crush").is_some());
-        assert!(value.pointer("/pgs").is_some());
+        assert!(status.success());
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["type"], "status");
+        assert_eq!(value["status"]["stub"], true);
+        assert!(value["tree"].is_null());
         assert!(
             elapsed < QUERY_SECS * 2.0,
-            "tick took {elapsed:.2}s; seven concurrent {QUERY_SECS}s queries should not approach \
-             the {:.2}s sequential cost",
-            QUERY_SECS * 7.0
+            "first status waited {elapsed:.2}s for 2s details"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn cluster_stream_keeps_status_fast_and_rotates_detail_queries() {
-        let script = cluster_stream_command(1);
-
-        assert!(script.contains("case \"$phase\" in"));
-        assert!(script.contains("phase=$(( (phase + 1) % 4 ))"));
-        assert!(script.contains("|| : >\"$dir/status\""));
-        assert!(script.contains("|| : >\"$dir/tree\""));
-        assert!(script.contains("|| : >\"$dir/df\""));
-        assert!(script.contains("|| : >\"$dir/perf\""));
-        assert!(script.contains("|| : >\"$dir/osdmap\""));
-        assert!(script.contains("|| : >\"$dir/crush\""));
-        assert!(script.contains("|| : >\"$dir/pgs\""));
-        assert_eq!(script.matches("sudo -n ceph -s --format json").count(), 2);
+    fn cluster_stream_refreshes_details_without_repeating_static_queries() {
+        use std::{fs, process::Command};
+        let (root, bin) = stub_admin_host("detail-refresh");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{{ {} }} | head -3", cluster_stream_command(1)))
+            .env("PATH", format!("{}:{}", bin.display(), env!("PATH")))
+            .env("HOME", &root)
+            .output()
+            .unwrap();
+        let queries = fs::read_to_string(root.join("queries")).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(output.status.success());
+        let payload = String::from_utf8(output.stdout).unwrap();
+        let values = payload
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 3);
+        assert!(values[0]["tree"].is_null());
+        for name in ["tree", "df", "perf", "osdmap", "crush", "pgs"] {
+            assert_eq!(values[2][name]["stub"], true, "missing {name}");
+        }
         assert_eq!(
-            script
-                .matches("sudo -n ceph osd tree --format json")
+            queries
+                .lines()
+                .filter(|line| line.starts_with("osd tree "))
                 .count(),
-            2
+            1
         );
         assert_eq!(
-            script.matches("sudo -n ceph osd df --format json").count(),
-            2
-        );
-        assert_eq!(
-            script
-                .matches("sudo -n ceph osd perf --format json")
+            queries
+                .lines()
+                .filter(|line| line.starts_with("osd crush "))
                 .count(),
-            2
-        );
-        assert_eq!(
-            script
-                .matches("sudo -n ceph osd dump --format json")
-                .count(),
-            2
-        );
-        assert_eq!(
-            script
-                .matches("sudo -n ceph osd crush rule dump --format json")
-                .count(),
-            2
-        );
-        assert_eq!(
-            script
-                .matches("sudo -n ceph pg dump pgs --format json")
-                .count(),
-            2
+            1
         );
     }
 
@@ -447,7 +438,7 @@ mod tests {
     // Regression: the scratch dir the concurrent tick needs was left behind when
     // the controller closed the stream, because a blocked write kills the remote
     // shell with SIGPIPE and an EXIT-only trap never runs.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn cluster_stream_removes_its_scratch_dir_when_the_reader_closes() {
         use std::{fs, process::Command};
