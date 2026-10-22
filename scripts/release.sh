@@ -55,7 +55,8 @@ awk -v v="$new" '/^version = "/ && !done {sub(/"[^"]+"/, "\"" v "\""); done=1} {
 cargo check --quiet # refresh Cargo.lock and sanity-check the build before tagging
 
 git add Cargo.toml Cargo.lock
-git commit -s -m "release: $tag"
+git -c gpg.format=openpgp commit -S -s -m "Release $tag"
+git -c gpg.format=openpgp verify-commit HEAD
 git tag -a "$tag" -m "$tag"
 
 if [ "$assume_yes" -ne 1 ]; then
