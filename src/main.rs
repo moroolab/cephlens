@@ -689,7 +689,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         return Ok(false);
     }
 
-    if matches!(app.mode, Mode::Live) && handle_panel_key(app, key) {
+    if matches!(app.mode, Mode::Live | Mode::Replay { .. }) && handle_panel_key(app, key) {
         return Ok(false);
     }
 

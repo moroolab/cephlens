@@ -32,11 +32,8 @@ const TEXT: Color = Color::Rgb(198, 208, 219);
 
 pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 pub(crate) const MIN_TERMINAL_HEIGHT: u16 = 20;
-// Nodes need 40 columns before ratatui squeezes the host column, and the
-// compact OSD map needs 44 for OSD, host, and state.
+// Keep enough room for the compact node and OSD tables side by side.
 pub(crate) const OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH: u16 = 84;
-// Seven node columns total 36 cells and their six gaps add 6, so that border
-// needs 44; the full OSD table starts fitting from 60.
 const OVERVIEW_FULL_WIDTH: u16 = 104;
 const RECOMMENDED_TERMINAL_WIDTH: u16 = OVERVIEW_FULL_WIDTH;
 
@@ -47,7 +44,11 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         draw_terminal_size_gate(frame, app, area);
         return;
     }
-    let log_height = event_log_height_for(area, app.event_log_height);
+    let log_height = if app.focused_panel == PanelFocus::Logs {
+        event_log_height_for(area, app.event_log_height)
+    } else {
+        1
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -278,9 +279,9 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
             Style::default().fg(TEXT),
         )],
         header_kv("data", data_label(cluster), TEXT),
-        header_kv("pg", pg_label(cluster), TEXT),
     ];
     if matches!(app.mode, Mode::Replay { .. }) {
+        segments.push(header_kv("pg", pg_label(cluster), TEXT));
         segments.push(header_kv("mon/mgr", mon_label(cluster), TEXT));
         segments.push(vec![Span::styled(
             "  left/right move  q quit",
@@ -290,6 +291,7 @@ fn header_line(app: &App, width: u16) -> Line<'static> {
         // Stream state comes before the static profile facts: when SSH is
         // reconnecting, every other value on screen is stale.
         segments.push(header_kv("status", stream_status_label(app), WARN));
+        segments.push(header_kv("pg", pg_label(cluster), TEXT));
         segments.push(header_kv("mon/mgr", mon_label(cluster), TEXT));
         segments.push(header_kv("profile", app.profile.clone(), OK));
         segments.push(header_kv("admin", app.admin_host.clone(), OK));
@@ -417,78 +419,107 @@ fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    let show_insights = area.height >= 15;
-    let base_top = if show_insights {
-        if area.height >= 30 {
-            11
-        } else if area.height >= 22 {
-            8
-        } else {
-            5
-        }
-    } else if area.height >= 17 {
-        8
+    let tracing = trace_has_content(app);
+    let trace_min = if tracing { 5 } else { 3 };
+    let insights = dashboard_insights(app);
+    let insight_height = if insights.is_empty() {
+        0
     } else {
-        5
-    };
-    let trace_min_height = if show_insights {
-        if area.height >= 30 {
-            7
-        } else if area.height >= 22 {
-            6
-        } else {
-            4
-        }
-    } else if area.height >= 17 {
-        7
-    } else {
-        4
-    };
-    if show_insights {
-        let insight_height = insight_height_for(
-            if area.height >= 22 { 8 } else { 5 },
+        insight_height_for(
+            (insights.len() as u16 + 2).min(6),
             app.insights_offset,
             area.height,
-            trace_min_height,
-        );
-        let top_height = clamp_overview_height(
-            base_top,
-            app.overview_offset,
-            area.height,
-            insight_height,
-            trace_min_height,
-        );
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(top_height),
-                Constraint::Length(insight_height),
-                Constraint::Min(trace_min_height),
-            ])
-            .split(area);
-
-        draw_overview(frame, app, chunks[0]);
+            trace_min,
+        )
+    };
+    let osd_count = app.snapshot.as_ref().map_or(0, |s| s.osds.len());
+    let base_top = (app.hosts.len().max(osd_count) as u16 + 3).clamp(5, 11);
+    let top_height = clamp_overview_height(
+        base_top,
+        app.overview_offset,
+        area.height,
+        insight_height,
+        trace_min,
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_height),
+            Constraint::Length(insight_height),
+            if tracing {
+                Constraint::Min(trace_min)
+            } else {
+                Constraint::Length(trace_min)
+            },
+            if tracing {
+                Constraint::Length(0)
+            } else {
+                Constraint::Min(0)
+            },
+        ])
+        .split(area);
+    draw_overview(frame, app, chunks[0]);
+    if insight_height > 0 {
         draw_insights(frame, app, chunks[1]);
+    }
+    if tracing {
         draw_trace_events(frame, app, chunks[2]);
     } else {
-        let top_height = clamp_overview_height(
-            base_top,
-            app.overview_offset,
-            area.height,
-            0,
-            trace_min_height,
+        let hint = if matches!(app.mode, Mode::Replay { .. }) {
+            "Left/Right review snapshots  ·  Tab inspect panels"
+        } else {
+            "t OSD trace  ·  f CephFS trace  ·  r RADOS trace"
+        };
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(TEXT))
+                .block(panel_block(
+                    app,
+                    PanelFocus::Trace,
+                    " trace ready ".into(),
+                    None,
+                )),
+            chunks[2],
         );
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(top_height),
-                Constraint::Min(trace_min_height),
-            ])
-            .split(area);
-
-        draw_overview(frame, app, chunks[0]);
-        draw_trace_events(frame, app, chunks[1]);
     }
+}
+
+fn trace_has_content(app: &App) -> bool {
+    let osd = app.trace_following
+        || app.trace_active > 0
+        || !app.trace_events.is_empty()
+        || !app.trace_series.is_empty();
+    let rados = app.radostrace_active > 0 || !app.radostrace_events.is_empty();
+    if app.flow_view {
+        let cutoff = Utc::now().timestamp() - app.trace_window_secs.max(1) as i64;
+        app.trace_following
+            || app.trace_active > 0
+            || app.radostrace_active > 0
+            || app
+                .trace_events
+                .iter()
+                .any(|event| event.observed_at >= cutoff)
+            || app
+                .radostrace_events
+                .iter()
+                .any(|event| event.observed_at >= cutoff)
+    } else {
+        match app.trace_source {
+            TraceSource::Osdtrace => osd,
+            TraceSource::Kfstrace => app.kfstrace_active > 0 || !app.kfstrace_events.is_empty(),
+            TraceSource::Radostrace => rados,
+        }
+    }
+}
+
+fn dashboard_insights(app: &App) -> Vec<Insight> {
+    operator_insights(app)
+        .into_iter()
+        .filter(|insight| {
+            app.focused_panel == PanelFocus::Insights
+                || matches!(insight.level, InsightLevel::Warn | InsightLevel::Bad)
+        })
+        .collect()
 }
 
 fn insight_height_for(base: u16, offset: i16, total: u16, trace_min: u16) -> u16 {
@@ -502,14 +533,21 @@ fn clamp_overview_height(base: u16, offset: i16, total: u16, insight: u16, trace
 }
 
 fn draw_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let nodes_width = if area.width >= OVERVIEW_FULL_WIDTH {
-        44
-    } else if area.width >= OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH {
-        40
-    } else {
+    let detailed = app.focused_panel == PanelFocus::Nodes;
+    if area.width < OVERVIEW_SIDE_BY_SIDE_MIN_WIDTH
+        || (detailed && area.width < OVERVIEW_FULL_WIDTH)
+    {
         draw_stacked_nodes_osds(frame, app, area);
         return;
-    };
+    }
+    let host_width = app
+        .hosts
+        .iter()
+        .map(|host| display_host(app, host).chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(9) as u16;
+    let nodes_width = (host_width + if detailed { 36 } else { 19 }).min(area.width - 44);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(nodes_width), Constraint::Min(44)])
@@ -590,7 +628,7 @@ fn footer_commands(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Esc", "back"),
             ("q", "quit"),
         ],
-        Mode::Replay { .. } => vec![("Left/Right", "replay"), ("q", "quit")],
+        Mode::Replay { .. } => vec![("Left/Right", "replay"), ("Tab", "panel"), ("q", "quit")],
     }
 }
 
@@ -630,6 +668,8 @@ fn help_commands(app: &App) -> Vec<(&'static str, &'static str)> {
         ],
         Mode::Replay { .. } => vec![
             ("Left/Right", "previous / next snapshot"),
+            ("Tab / Shift+Tab", "focus next / previous panel"),
+            ("Up/Dn j/k", "scroll focused panel"),
             ("q / Esc", "quit"),
         ],
     }
@@ -695,7 +735,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_insights(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let visible = area.height.saturating_sub(2).max(1) as usize;
-    let insights = operator_insights(app);
+    let insights = dashboard_insights(app);
     let total = insights.len();
     let scroll = clamp_top_scroll(app.insights_scroll, total, visible);
     let lines = insights
@@ -1607,53 +1647,72 @@ fn osdtrace_glyph(app: &App, host: &str) -> (&'static str, Color) {
     }
 }
 
+fn display_host(app: &App, host: &str) -> String {
+    let node = app.node_summaries.get(host).or_else(|| {
+        app.snapshot
+            .as_ref()?
+            .nodes
+            .iter()
+            .find(|node| node.host == host)
+    });
+    let label = node
+        .filter(|node| !node.hostname.is_empty())
+        .map_or(host, |node| node.hostname.as_str());
+    label.rsplit('@').next().unwrap_or(label).to_owned()
+}
+
 fn draw_nodes(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
-    let max_host_len = app.hosts.iter().map(|h| h.len()).max().unwrap_or(4).max(4);
-    let host_width = if area.width >= 50 {
-        max_host_len.max(9)
-    } else {
-        9
-    };
-    let rows = node_rows(app, host_width);
+    let detailed = app.focused_panel == PanelFocus::Nodes;
+    let max_host_len = app
+        .hosts
+        .iter()
+        .map(|h| display_host(app, h).chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let host_width =
+        max_host_len.min(area.width.saturating_sub(if detailed { 36 } else { 19 }) as usize);
+    let rows = node_rows(app, host_width, detailed);
     let visible = table_visible_rows(area);
     let total = rows.len();
     let scroll = clamp_top_scroll(app.nodes_scroll, total, visible);
+    let mut widths = vec![
+        Constraint::Length(host_width as u16),
+        Constraint::Length(6),
+        Constraint::Length(2),
+        Constraint::Length(4),
+    ];
+    let mut headers = vec!["Node", "State", "T", "OSD"];
+    if detailed {
+        widths.extend([
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(6),
+        ]);
+        headers.extend(["CPU%", "MEM%", "IO PSI"]);
+    }
     frame.render_widget(
-        Table::new(
-            rows.into_iter().skip(scroll).take(visible),
-            [
-                Constraint::Length(host_width as u16),
-                Constraint::Length(6),
-                Constraint::Length(2),
-                Constraint::Length(4),
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Length(5),
-            ],
-        )
-        .header(
-            Row::new(["Host", "State", "T", "OSD", "CPU%", "MEM%", "IO%"])
-                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD)),
-        )
-        .block(panel_block(
-            app,
-            PanelFocus::Nodes,
-            nodes_osd_panel_title(
+        Table::new(rows.into_iter().skip(scroll).take(visible), widths)
+            .header(Row::new(headers).style(Style::default().fg(MUTED).bold()))
+            .block(panel_block(
                 app,
                 PanelFocus::Nodes,
-                "nodes",
-                total,
-                visible,
-                scroll,
-                tabbed,
-            ),
-            resize_hint(app, PanelFocus::Nodes, area),
-        )),
+                nodes_osd_panel_title(
+                    app,
+                    PanelFocus::Nodes,
+                    "nodes",
+                    total,
+                    visible,
+                    scroll,
+                    tabbed,
+                ),
+                resize_hint(app, PanelFocus::Nodes, area),
+            )),
         area,
     );
 }
 
-fn node_rows(app: &App, host_width: usize) -> Vec<Row<'static>> {
+fn node_rows(app: &App, host_width: usize, detailed: bool) -> Vec<Row<'static>> {
     let replay_nodes = app
         .snapshot
         .as_ref()
@@ -1693,21 +1752,27 @@ fn node_rows(app: &App, host_width: usize) -> Vec<Row<'static>> {
                 .map(|node| percent_label(node.io_stall_percent))
                 .unwrap_or_else(|| "-".to_owned());
             let (glyph, glyph_color) = osdtrace_glyph(app, host);
-            Row::new(vec![
-                Cell::from(short(host, host_width)).style(Style::default().fg(ACCENT).bold()),
+            let mut cells = vec![
+                Cell::from(short(&display_host(app, host), host_width))
+                    .style(Style::default().fg(ACCENT).bold()),
                 Cell::from(state).style(Style::default().fg(color).bold()),
                 Cell::from(glyph).style(Style::default().fg(glyph_color).bold()),
                 Cell::from(osds),
-                Cell::from(cpu).style(Style::default().fg(metric_color(
-                    node.map(|node| node.cpu_percent).unwrap_or_default(),
-                ))),
-                Cell::from(mem).style(Style::default().fg(metric_color(
-                    node.map(|node| node.mem_percent).unwrap_or_default(),
-                ))),
-                Cell::from(io_stall).style(Style::default().fg(stall_color(
-                    node.map(|node| node.io_stall_percent).unwrap_or_default(),
-                ))),
-            ])
+            ];
+            if detailed {
+                cells.extend([
+                    Cell::from(cpu).style(Style::default().fg(metric_color(
+                        node.map(|node| node.cpu_percent).unwrap_or_default(),
+                    ))),
+                    Cell::from(mem).style(Style::default().fg(metric_color(
+                        node.map(|node| node.mem_percent).unwrap_or_default(),
+                    ))),
+                    Cell::from(io_stall).style(Style::default().fg(stall_color(
+                        node.map(|node| node.io_stall_percent).unwrap_or_default(),
+                    ))),
+                ]);
+            }
+            Row::new(cells)
         })
         .collect()
 }
@@ -1722,7 +1787,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
     let max_pgs = osds.iter().map(|osd| osd.pgs).max().unwrap_or(1).max(1);
     let host_width = osds
         .iter()
-        .map(|osd| osd.host.len())
+        .map(|osd| display_host(app, &osd.host).len())
         .max()
         .unwrap_or(4)
         .max(4) as u16;
@@ -1730,6 +1795,7 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
     // Stay compact until that actually fits instead of letting ratatui squeeze
     // the Host column first.
     let compact = area.width < (88 + host_width).max(72);
+    let show_commit = osds.iter().any(|osd| osd.commit_latency_ms > 0);
     let visible = table_visible_rows(area);
     let total = osds.len();
     let scroll = clamp_top_scroll(app.osds_scroll, total, visible);
@@ -1744,19 +1810,22 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
             BLUE,
         );
         if compact {
-            // Commit latency stays in the compact set: it is the first value
-            // an operator checks when hunting a slow OSD.
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
-                Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
+                Cell::from(display_host(app, &osd.host)).style(Style::default().fg(TEXT)),
                 Cell::from(map_state).style(status_style),
-                Cell::from(latency_ms_label(osd.commit_latency_ms))
-                    .style(Style::default().fg(latency_color(osd.commit_latency_ms * 1_000))),
-            ])
+            ];
+            if show_commit {
+                cells.push(
+                    Cell::from(latency_ms_label(osd.commit_latency_ms))
+                        .style(Style::default().fg(latency_color(osd.commit_latency_ms * 1_000))),
+                );
+            }
+            Row::new(cells)
         } else {
             Row::new(vec![
                 Cell::from(osd.name.clone()).style(Style::default().fg(ACCENT).bold()),
-                Cell::from(osd.host.clone()).style(Style::default().fg(TEXT)),
+                Cell::from(display_host(app, &osd.host)).style(Style::default().fg(TEXT)),
                 Cell::from(map_state).style(status_style),
                 Cell::from(format!("{:.3}%", osd.utilization)),
                 Cell::from(osd.pgs.to_string()),
@@ -1772,15 +1841,17 @@ fn draw_osds(frame: &mut Frame<'_>, app: &App, area: Rect, tabbed: bool) {
     });
 
     let (widths, header) = if compact {
-        (
-            vec![
-                Constraint::Length(7),
-                Constraint::Min(host_width),
-                Constraint::Length(8),
-                Constraint::Length(7),
-            ],
-            Row::new(vec!["OSD", "Host", "State", "Commit"]),
-        )
+        let mut widths = vec![
+            Constraint::Length(7),
+            Constraint::Min(host_width),
+            Constraint::Length(8),
+        ];
+        let mut headers = vec!["OSD", "Node", "State"];
+        if show_commit {
+            widths.push(Constraint::Length(7));
+            headers.push("Commit");
+        }
+        (widths, Row::new(headers))
     } else {
         (
             vec![
@@ -1840,6 +1911,17 @@ fn osd_map_state(status: &str, reweight: f64) -> (String, Color) {
 }
 
 fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if area.height == 1 {
+        let latest = app.logs.last().map_or("no events yet", String::as_str);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" log ", Style::default().fg(MUTED)),
+                Span::styled(latest.to_owned(), Style::default().fg(TEXT)),
+            ])),
+            area,
+        );
+        return;
+    }
     let visible = area.height.saturating_sub(2) as usize;
     let total = app.logs.len();
     let scroll = clamp_bottom_scroll(app.logs_scroll, total, visible);
@@ -2141,7 +2223,7 @@ mod tests {
     use super::*;
     use crate::editor::{ConfigDraft, ConfigEditor};
     use crate::flow::{FlowMetric, FlowSort, FlowStats};
-    use crate::model::{OsdSummary, Snapshot};
+    use crate::model::{NodeSummary, OsdSummary, Snapshot};
     use crate::trace::TraceInstallConfig;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -2426,6 +2508,184 @@ mod tests {
         }
     }
 
+    fn healthy_app() -> App {
+        let mut app = test_app();
+        let nodes = (1..=3)
+            .map(|i| NodeSummary {
+                host: format!("user@192.0.2.{i}"),
+                hostname: format!("storage-node-{i}"),
+                osd_ids: i.to_string(),
+                cpu_percent: 18.0,
+                mem_percent: 53.0,
+                ..NodeSummary::default()
+            })
+            .collect::<Vec<_>>();
+        app.hosts = nodes.iter().map(|node| node.host.clone()).collect();
+        app.snapshot = Some(Snapshot {
+            hosts: app.hosts.clone(),
+            osds: nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| OsdSummary {
+                    name: format!("osd.{}", index + 1),
+                    host: node.hostname.clone(),
+                    status: "up".to_owned(),
+                    reweight: 1.0,
+                    ..OsdSummary::default()
+                })
+                .collect(),
+            nodes,
+            ..snapshot_with_cluster(ClusterSummary {
+                health: "HEALTH_OK".to_owned(),
+                pg_states: "active+clean".to_owned(),
+                ..ClusterSummary::default()
+            })
+        });
+        app
+    }
+
+    fn render_app(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn idle_dashboard_stays_compact_and_expands_for_tracing() {
+        let mut app = healthy_app();
+        for (width, height) in [(80, 20), (104, 30), (160, 45)] {
+            let idle = render_app(&app, width, height);
+            let lines = idle.lines().collect::<Vec<_>>();
+            let trace_top = lines
+                .iter()
+                .position(|line| line.contains("trace ready"))
+                .unwrap();
+            assert!(lines[trace_top + 1].contains("t OSD trace"));
+            assert!(lines[trace_top + 2].starts_with('╰'));
+            assert!(!idle.contains("insights"));
+            if width <= 104 {
+                assert!(!idle.contains("Commit"));
+            }
+
+            app.trace_active = 1;
+            let active = render_app(&app, width, height);
+            assert!(!active.contains("trace ready"));
+            assert!(active.contains("trace graph: running"));
+            assert!(
+                active
+                    .lines()
+                    .nth(height as usize - 3)
+                    .unwrap()
+                    .starts_with('╰')
+            );
+            app.trace_active = 0;
+        }
+    }
+
+    #[test]
+    fn dashboard_shows_warnings_automatically_and_info_on_focus() {
+        let mut app = healthy_app();
+        app.insight_history.push_back(crate::app::TimedInsight {
+            captured_at: Utc::now(),
+            insight: Insight {
+                level: InsightLevel::Info,
+                text: "Trace sample collected".to_owned(),
+            },
+        });
+        assert!(!render_app(&app, 104, 20).contains("Trace sample collected"));
+        app.focused_panel = PanelFocus::Insights;
+        assert!(render_app(&app, 104, 20).contains("Trace sample collected"));
+
+        app.focused_panel = PanelFocus::Osds;
+        app.insight_history.push_back(crate::app::TimedInsight {
+            captured_at: Utc::now(),
+            insight: Insight {
+                level: InsightLevel::Warn,
+                text: "Slow replica response".to_owned(),
+            },
+        });
+        let rendered = render_app(&app, 104, 20);
+        assert!(rendered.contains("Slow replica response"));
+        assert!(!rendered.contains("Trace sample collected"));
+        app.focused_panel = PanelFocus::Logs;
+        assert!(render_app(&app, 104, 20).contains("Slow replica response"));
+    }
+
+    #[test]
+    fn node_details_expand_without_truncating_metric_headers() {
+        let mut app = healthy_app();
+        assert_eq!(display_host(&app, &app.hosts[0]), "storage-node-1");
+        assert_eq!(display_host(&app, "user@192.0.2.9"), "192.0.2.9");
+        for width in [80, 90, 104, 160] {
+            app.focused_panel = PanelFocus::Osds;
+            assert!(!render_app(&app, width, 30).contains("CPU%"));
+            app.focused_panel = PanelFocus::Nodes;
+            let detailed = render_app(&app, width, 30);
+            for text in [
+                "storage-node-1",
+                "storage-node-2",
+                "storage-node-3",
+                "CPU%",
+                "MEM%",
+                "IO PSI",
+            ] {
+                assert!(detailed.contains(text), "missing {text} at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn event_log_shows_latest_line_and_expands_on_focus() {
+        let mut app = healthy_app();
+        app.logs = vec!["Earlier event".to_owned(), "Latest event".to_owned()];
+        let compact = render_app(&app, 104, 30);
+        assert!(compact.lines().nth(28).unwrap().contains("Latest event"));
+        assert!(!compact.contains("Earlier event"));
+        app.focused_panel = PanelFocus::Logs;
+        let expanded = render_app(&app, 104, 30);
+        assert!(expanded.contains("Earlier event"));
+        assert!(expanded.contains("Latest event"));
+    }
+
+    #[test]
+    fn trace_expansion_matches_the_selected_source() {
+        let mut app = healthy_app();
+        app.trace_active = 1;
+        assert!(trace_has_content(&app));
+        app.trace_source = TraceSource::Kfstrace;
+        assert!(!trace_has_content(&app));
+        app.kfstrace_active = 1;
+        assert!(trace_has_content(&app));
+        app.trace_source = TraceSource::Radostrace;
+        assert!(!trace_has_content(&app));
+        app.radostrace_active = 1;
+        assert!(trace_has_content(&app));
+        app.radostrace_active = 0;
+        app.flow_view = true;
+        assert!(trace_has_content(&app));
+    }
+
+    #[test]
+    fn captured_rados_data_keeps_the_trace_and_flow_expanded() {
+        let mut app = healthy_app();
+        app.trace_source = TraceSource::Radostrace;
+        app.radostrace_events.push(
+            crate::radostrace::parse_rados_event(
+                "15915 89499 8 2 2 [1,2,3] W 4096 9023 object-a [write]",
+            )
+            .unwrap(),
+        );
+        let trace = render_app(&app, 104, 30);
+        assert!(trace.contains("radostrace"));
+        assert!(trace.contains("pool 2"));
+        app.flow_view = true;
+        let flow = render_app(&app, 104, 30);
+        assert!(flow.contains("object-a"));
+        assert!(flow.lines().nth(27).unwrap().starts_with('╰'));
+        app.radostrace_events[0].observed_at -= app.trace_window_secs as i64 + 1;
+        assert!(render_app(&app, 104, 30).contains("trace ready"));
+    }
+
     #[test]
     fn osd_map_accommodates_long_hostnames() {
         let mut app = test_app();
@@ -2561,7 +2821,8 @@ mod tests {
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("nodes"));
         assert!(rendered.contains("osd map"));
-        assert!(rendered.contains("CPU%"));
+        assert!(rendered.contains("State"));
+        assert!(!rendered.contains("CPU%"));
         assert!(rendered.contains("osd.0"));
         assert!(!rendered.contains("vitals"));
     }
