@@ -354,8 +354,9 @@ terminal is recommended for the full dashboard. Live SSH streams and automatic
 tracing do not start until the terminal reaches the minimum size. The header is
 a single row that shows health, OSD up/in, IO rate, data usage, PG states, and
 mon/mgr counts; narrower terminals drop the trailing items first.
-On wide terminals the trace panel appears on the right; on tall terminals it
-appears below the dashboard.
+Nodes and the OSD map share the top row when space allows. The overview fits
+its rows, and the trace panel below it expands when the selected source is
+running or has captured data. Idle tracing uses a compact start hint.
 Live TUI mode keeps one SSH stream open for cluster status and one stream per
 host for node readiness. `refresh_secs` is the pause between ticks, so the
 period an operator sees is that pause plus the time the remote queries take. On
@@ -365,13 +366,14 @@ crush rule dump` rotates in. Static node facts are collected when the stream
 connects, OSD processes are scanned no more often than every five seconds, and
 CPU, memory, and pressure values follow `refresh_secs`. That OSD scan also
 reads any systemd `IOWriteBandwidthMax` applied to an OSD service. The node
-table shows connection state (`live`, `dial`, `retry`, `error`), OSD ids, CPU
-percentage, and memory percentage. The TUI redraws after input or new stream
-data instead of on every event poll. The insights panel starts taller than
-before and, like the overview, trace, and event-log panels, can be focused with
-`Tab` and resized with `+` or `-`. It retains up to 400 non-OK observations for
-15 minutes; focus it and use `j`/`k`, arrow keys, Page Up/Down, or Home/End to
-review evidence that has disappeared from the current cluster snapshot.
+table shows connection state (`live`, `dial`, `retry`, `error`) and OSD ids.
+Focus Nodes with `Tab` to reveal CPU, memory, and IO pressure (IO PSI).
+The TUI redraws after input or new stream data instead of on every event poll.
+Warnings and errors appear automatically; focus Insights to include normal
+observations. Insights retains up to 400 non-OK observations for 15 minutes.
+Use `j`/`k`, arrow keys, Page Up/Down, or Home/End to review older evidence.
+The event log shows its latest line until focused, then expands. Focused
+overview, insights, trace, and event-log panels can be resized with `+` or `-`.
 When an OSD block-write limit is present, the five-second OSD scan also reads a
 bounded `dump_ops_in_flight` response from that local OSD so Insights can name
 the oldest pending operation, wait point, PG, and object where available.
